@@ -1,0 +1,12 @@
+kind: FleetConfig
+metadata:
+  name: dev-fleet
+spec:
+  compartmentId: ocid1.compartments.oc1..example..aaaaaaa
+  imageId: ocid1.image.oc1..example..bbbbbbbbb
+  availabilityDomain: PHX-AD-1
+  definedTags: {}
+  freeformTags: {}
+  instances:
+  - name: web-server
+    count: 0  # Start with 0 instances to test creation logic
