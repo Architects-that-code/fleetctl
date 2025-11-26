@@ -12,7 +12,7 @@ bin/
 coverage.out
 
 # FleetCTL local state (do not commit)
-.fleetctl/
+#.fleetctl/
 
 # macOS
 .DS_Store

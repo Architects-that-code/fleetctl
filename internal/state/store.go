@@ -233,3 +233,94 @@ func (s *Store) Summary(fleetName string) (string, error) {
 	}
 	return out, nil
 }
+
+// AddActiveRecord appends a specific active instance record (e.g., after OCI launch).
+func (s *Store) AddActiveRecord(fleetName, group, id, name string) error {
+	now := time.Now()
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	r, err := s.load()
+	if err != nil {
+		return err
+	}
+	fs := r.Fleets[fleetName]
+	fs.FleetName = fleetName
+
+	rec := InstanceRecord{
+		ID:        id,
+		Group:     group,
+		Name:      name,
+		Status:    StatusActive,
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	fs.Instances = append(fs.Instances, rec)
+
+	fs.UpdatedAt = now
+	r.Fleets[fleetName] = fs
+	return s.save(r)
+}
+
+// ActiveRecordsLIFO returns up to n active records in LIFO order without mutating state.
+func (s *Store) ActiveRecordsLIFO(fleetName string, n int) ([]InstanceRecord, error) {
+	if n <= 0 {
+		return nil, nil
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	r, err := s.load()
+	if err != nil {
+		return nil, err
+	}
+	fs := r.Fleets[fleetName]
+
+	activeIdx := make([]int, 0, len(fs.Instances))
+	for idx, inst := range fs.Instances {
+		if inst.Status == StatusActive {
+			activeIdx = append(activeIdx, idx)
+		}
+	}
+	sort.Ints(activeIdx)
+
+	out := make([]InstanceRecord, 0, n)
+	for i := len(activeIdx) - 1; i >= 0 && len(out) < n; i-- {
+		idx := activeIdx[i]
+		out = append(out, fs.Instances[idx])
+	}
+	return out, nil
+}
+
+// MarkTerminatedByIDs marks any instances with matching IDs as terminated.
+func (s *Store) MarkTerminatedByIDs(fleetName string, ids []string) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	now := time.Now()
+	idset := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		idset[id] = struct{}{}
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	r, err := s.load()
+	if err != nil {
+		return err
+	}
+	fs := r.Fleets[fleetName]
+
+	for i := range fs.Instances {
+		if _, ok := idset[fs.Instances[i].ID]; ok && fs.Instances[i].Status == StatusActive {
+			fs.Instances[i].Status = StatusTerminated
+			fs.Instances[i].UpdatedAt = now
+		}
+	}
+	fs.UpdatedAt = now
+	r.Fleets[fleetName] = fs
+	return s.save(r)
+}

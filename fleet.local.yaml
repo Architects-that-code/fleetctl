@@ -1,4 +1,4 @@
-# yaml-language-server: $schema=../schema/fleetctl.schema.json
+# yaml-language-server: $schema=./schema/fleetctl.schema.json
 # FleetCTL local development configuration template
 # Use this when running on a workstation where Instance Principal auth is not available.
 
@@ -14,7 +14,15 @@ spec:
   imageId: "ocid1.image.oc1.iad.aaaaaaaalbyf7m5dvdcaujoj5wplgqepqlodgkxznrzrmmdawqoqzperwtga"
 
   # OPTIONAL: Availability Domain (e.g., PHX-AD-1)
-  availabilityDomain: "PHX-AD-1"
+  # Leave empty to auto-resolve an AD in the configured region
+  availabilityDomain: ""
+  # REQUIRED: Compute shape (use non-Flex unless you also set shapeConfig support)
+  shape: "VM.Standard.E5.Flex"
+  shapeConfig:
+    ocpus: 2
+    memoryInGBs: 16
+  # REQUIRED: Subnet OCID for the primary VNIC (default for groups unless overridden)
+  subnetId: "ocid1.subnet.oc1.iad.aaaaaaaa3mjqpf4ddhccc4mdgwsj3bgotl5w2l72lc447zo3qzx4smsadexa"
 
   # Authentication for OCI SDK (local workstation uses user principal)
   auth:
@@ -26,7 +34,7 @@ spec:
     profile: "DEFAULT"
     # Optional region override. If unset, uses OCI_REGION env or provider region.
     # Set this explicitly for deterministic behavior on a workstation:
-    region: ""
+    region: "us-ashburn-1"
 
   # OPTIONAL: Defined tags (namespace-scoped)
   definedTags:
@@ -35,6 +43,7 @@ spec:
   # OPTIONAL: Freeform tags
   freeformTags:
     # "key": "value"
+    "automated-by": "fleetctl"
 
   # REQUIRED: One or more instance groups
   # For local testing of commands (e.g., --auth-validate, --status), keep counts at 0
@@ -42,3 +51,4 @@ spec:
   instances:
     - name: web
       count: 0
+      subnetId: "ocid1.subnet.oc1.iad.aaaaaaaa3mjqpf4ddhccc4mdgwsj3bgotl5w2l72lc447zo3qzx4smsadexa"

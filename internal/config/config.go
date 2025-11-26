@@ -20,10 +20,14 @@ type Metadata struct {
 }
 
 type Spec struct {
-	CompartmentID      string `yaml:"compartmentId"`
-	ImageID            string `yaml:"imageId"`
-	AvailabilityDomain string `yaml:"availabilityDomain"`
-	Auth               Auth   `yaml:"auth"`
+	CompartmentID      string       `yaml:"compartmentId"`
+	ImageID            string       `yaml:"imageId"`
+	AvailabilityDomain string       `yaml:"availabilityDomain"`
+	Shape              string       `yaml:"shape"`
+	ShapeConfig        *ShapeConfig `yaml:"shapeConfig"` // required when using Flex shapes
+	SubnetID           string       `yaml:"subnetId"`
+	DisplayNamePrefix  string       `yaml:"displayNamePrefix"`
+	Auth               Auth         `yaml:"auth"`
 	// ... other fields
 	DefinedTags  map[string]string `yaml:"definedTags"` // or a more complex type
 	FreeformTags map[string]string `yaml:"freeformTags"`
@@ -31,8 +35,15 @@ type Spec struct {
 }
 
 type InstanceSpec struct {
-	Name  string `yaml:"name"`
-	Count int    `yaml:"count"`
+	Name     string `yaml:"name"`
+	Count    int    `yaml:"count"`
+	SubnetID string `yaml:"subnetId"` // optional per-group override; falls back to spec.subnetId
+}
+
+// ShapeConfig config for Flexible shapes (e.g., VM.Standard.*.Flex)
+type ShapeConfig struct {
+	OCPUs       float32 `yaml:"ocpus"`
+	MemoryInGBs float32 `yaml:"memoryInGBs"`
 }
 
 type Auth struct {

@@ -30,6 +30,8 @@
       "required": [
         "compartmentId",
         "imageId",
+        "shape",
+        "subnetId",
         "instances"
       ],
       "properties": {
@@ -46,6 +48,41 @@
         "availabilityDomain": {
           "type": "string",
           "description": "Availability domain (e.g., PHX-AD-1)"
+        },
+        "shape": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Compute shape (e.g., VM.Standard.E2.1.Micro or VM.Standard.E5.Flex)"
+        },
+        "shapeConfig": {
+          "type": "object",
+          "description": "Required when using flexible shapes (e.g., VM.Standard.*.Flex)",
+          "additionalProperties": false,
+          "properties": {
+            "ocpus": {
+              "type": "number",
+              "minimum": 0.25,
+              "description": "Number of OCPUs for Flex shapes"
+            },
+            "memoryInGBs": {
+              "type": "number",
+              "minimum": 1,
+              "description": "Memory in GB for Flex shapes"
+            }
+          },
+          "required": [
+            "ocpus",
+            "memoryInGBs"
+          ]
+        },
+        "subnetId": {
+          "type": "string",
+          "minLength": 1,
+          "description": "OCID of the subnet for the primary VNIC"
+        },
+        "displayNamePrefix": {
+          "type": "string",
+          "description": "Optional prefix for instance display names (default: <fleet>-<group>)"
         },
         "auth": {
           "type": "object",
@@ -110,6 +147,10 @@
                 "type": "integer",
                 "minimum": 0,
                 "description": "Desired count for this group"
+              },
+              "subnetId": {
+                "type": "string",
+                "description": "Optional per-group subnet override; defaults to spec.subnetId"
               }
             }
           }

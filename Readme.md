@@ -2,7 +2,7 @@
 
 A CLI to manage a fleet of OCI compute instances from a simple YAML configuration.
 
-Status: v0.1.0 (bootstrapped; client and fleet operations are stubbed for now)
+Status: v0.1.0 (auth validation, scale, and rolling restart implemented; use with caution)
 
 ## Quickstart
 
@@ -37,8 +37,8 @@ Invocation rule: Requires --config plus at least one additional flag. If not pro
 
 Flags (modeled as flags for v0.1.x; may become subcommands later):
 - --config string      Path to YAML config (default "fleet.yaml")
-- --scale int          Scale fleet to desired total (stubbed)
-- --rolling-restart    Perform rolling restart (stubbed)
+- --scale int          Scale fleet to desired total
+- --rolling-restart    Perform rolling restart
 - --auth-validate      Validate OCI authentication (performs a lightweight IAM call)
 - --status             Print tracked fleet state from local store and exit
 - --state string       Path to local state JSON (default ".fleetctl/state.json")
@@ -47,9 +47,9 @@ Flags (modeled as flags for v0.1.x; may become subcommands later):
 Examples:
 - Print summary:
   make run ARGS="--config fleet.yaml"
-- Scale to 3 (stubbed behavior for now):
+- Scale to 3 (performs real OCI operations):
   make run ARGS="--config fleet.yaml --scale 3"
-- Rolling restart (stubbed behavior for now):
+- Rolling restart (performs real OCI operations):
   make run ARGS="--config fleet.yaml --rolling-restart"
 - Auth validation:
   make run ARGS="--config fleet.yaml --auth-validate"
@@ -59,6 +59,8 @@ Exit Codes:
 - 1: invalid arguments or configuration
 - 2: infrastructure operation error (create/terminate/list etc.)
 - 3: unexpected internal error
+
+Important: Scale and rolling-restart perform real OCI operations (instance create/terminate). Use a sandbox compartment, verify shape/subnetId, and prefer fleet.local.yaml for local testing.
 
 ## Configuration
 
@@ -73,8 +75,15 @@ Important fields (see docs/fleetctl-spec.md for full details):
 - spec.compartmentId: OCI compartment OCID
 - spec.imageId: OCI image OCID
 - spec.availabilityDomain: e.g., "PHX-AD-1"
+- spec.shape: Compute shape (e.g., VM.Standard.E2.1.Micro)
+- spec.subnetId: Subnet OCID for the primary VNIC
+- spec.displayNamePrefix: optional prefix for instance display names
 - spec.definedTags, spec.freeformTags: optional tag maps
-- spec.instances[]: array of groups { name, count }
+- spec.instances[]: array of groups { name, count [, subnetId] }
+
+Subnet selection precedence:
+- instances[].subnetId for the matched group (if set)
+- otherwise spec.subnetId
 
 ## Authentication
 
@@ -109,6 +118,7 @@ Note on Rancher Fleet extension warnings:
   - `configFile`: path to your OCI config (e.g., `~/.oci/config`)
   - `profile`: profile name (e.g., `DEFAULT`)
 - If using user principal and you see "OCI config file not found", ensure the `configFile` path exists and contains the specified `profile`.
+- You can also set OCI_CLI_CONFIG_FILE to an explicit config path; ~ (tilde) and environment variables in configFile are supported.
 - If the resolved region is empty or incorrect, set `spec.auth.region` or export `OCI_REGION` (e.g., `export OCI_REGION=us-phoenix-1`).
 - To verify and print details, run:
   - `make run ARGS="--config fleet.local.yaml --auth-validate"`

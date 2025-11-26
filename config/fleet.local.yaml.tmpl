@@ -16,6 +16,15 @@ spec:
   # OPTIONAL: Availability Domain (e.g., PHX-AD-1)
   availabilityDomain: "PHX-AD-1"
 
+  # REQUIRED: Compute shape (choose non-Flex unless you configure shapeConfig)
+  shape: "VM.Standard.E2.1.Micro"
+
+  # REQUIRED: Subnet OCID for the primary VNIC
+  subnetId: "<oci_subnet_ocid>"
+
+  # OPTIONAL: Prefix for instance display names (defaults to "<fleet>-<group>")
+  displayNamePrefix: ""
+
   # Authentication for OCI SDK (local workstation uses user principal)
   auth:
     # Local development: use the OCI CLI config file + profile
@@ -42,3 +51,5 @@ spec:
   instances:
     - name: web
       count: 0
+      # Optional per-group subnet override; defaults to spec.subnetId
+      # subnetId: "<oci_subnet_ocid>"

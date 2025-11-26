@@ -4,15 +4,19 @@ package client
 import (
 	"context"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"fleetctl/internal/config"
 
 	"github.com/oracle/oci-go-sdk/v65/common"
 	"github.com/oracle/oci-go-sdk/v65/common/auth"
+	"github.com/oracle/oci-go-sdk/v65/core"
 	"github.com/oracle/oci-go-sdk/v65/identity"
+	"github.com/oracle/oci-go-sdk/v65/workrequests"
 )
 
 // Client encapsulates OCI auth provider and region.
@@ -29,6 +33,13 @@ type AuthInfo struct {
 	UserOCID          string
 	RegionsCount      int
 	SubscribedRegions []string
+}
+
+// InstanceInfo represents minimal details for an OCI instance we manage.
+type InstanceInfo struct {
+	ID          string
+	DisplayName string
+	Lifecycle   string
 }
 
 // New initializes an OCI client using either:
@@ -159,8 +170,275 @@ func (c *Client) ValidateInfo(ctx context.Context) (AuthInfo, error) {
 	return info, nil
 }
 
+// waitWorkRequest polls a Work Request until it reaches Succeeded or Failed.
+func (c *Client) waitWorkRequest(ctx context.Context, id string, label string) error {
+	if c == nil || c.Provider == nil {
+		return fmt.Errorf("client not initialized")
+	}
+	wrc, err := workrequests.NewWorkRequestClientWithConfigurationProvider(c.Provider)
+	if err != nil {
+		return fmt.Errorf("workrequests client init: %w", err)
+	}
+	if c.Region != "" {
+		wrc.SetRegion(c.Region)
+	}
+	for {
+		resp, err := wrc.GetWorkRequest(ctx, workrequests.GetWorkRequestRequest{WorkRequestId: &id})
+		if err != nil {
+			return fmt.Errorf("work request %s: %w", id, err)
+		}
+		status := resp.WorkRequest.Status
+		pct := 0
+		if resp.WorkRequest.PercentComplete != nil {
+			pct = int(*resp.WorkRequest.PercentComplete)
+		}
+		log.Printf("%s: work request %s status=%s (%d%%)", label, id, status, pct)
+		switch status {
+		case workrequests.WorkRequestStatusSucceeded:
+			return nil
+		case workrequests.WorkRequestStatusFailed:
+			ers, _ := wrc.ListWorkRequestErrors(ctx, workrequests.ListWorkRequestErrorsRequest{WorkRequestId: &id})
+			if len(ers.Items) > 0 && ers.Items[0].Message != nil {
+				return fmt.Errorf("%s failed: %s", label, *ers.Items[0].Message)
+			}
+			return fmt.Errorf("%s failed", label)
+		}
+		time.Sleep(2 * time.Second)
+	}
+}
+
+// waitInstanceState polls an instance until it reaches the target lifecycle state.
+// For Terminated, a NotAuthorizedOrNotFound response is also treated as success.
+func (c *Client) waitInstanceState(ctx context.Context, id string, target core.InstanceLifecycleStateEnum) error {
+	if c == nil || c.Provider == nil {
+		return fmt.Errorf("client not initialized")
+	}
+	cc, err := core.NewComputeClientWithConfigurationProvider(c.Provider)
+	if err != nil {
+		return fmt.Errorf("compute client init: %w", err)
+	}
+	if c.Region != "" {
+		cc.SetRegion(c.Region)
+	}
+	for {
+		resp, err := cc.GetInstance(ctx, core.GetInstanceRequest{InstanceId: &id})
+		if err != nil {
+			if strings.Contains(strings.ToLower(err.Error()), "notauthorizedornotfound") && target == core.InstanceLifecycleStateTerminated {
+				log.Printf("wait %s: instance %s not found (treat as done)", target, id)
+				return nil
+			}
+			return fmt.Errorf("get instance %s: %w", id, err)
+		}
+		state := resp.Instance.LifecycleState
+		log.Printf("wait %s: instance %s state=%s", target, id, state)
+		if state == target {
+			return nil
+		}
+		time.Sleep(2 * time.Second)
+	}
+}
+
+// LaunchInstances creates n instances in OCI using details from cfg and returns their basic info.
+func (c *Client) LaunchInstances(ctx context.Context, cfg config.FleetConfig, group string, n int) ([]InstanceInfo, error) {
+	if n <= 0 {
+		return nil, nil
+	}
+	if c == nil || c.Provider == nil {
+		return nil, fmt.Errorf("client not initialized")
+	}
+	cc, err := core.NewComputeClientWithConfigurationProvider(c.Provider)
+	if err != nil {
+		return nil, fmt.Errorf("compute client init: %w", err)
+	}
+	if c.Region != "" {
+		cc.SetRegion(c.Region)
+	}
+
+	var out []InstanceInfo
+	prefix := cfg.Spec.DisplayNamePrefix
+	if strings.TrimSpace(prefix) == "" {
+		prefix = fmt.Sprintf("%s-%s", cfg.Metadata.Name, group)
+	}
+
+	// Resolve availability domain to a full AD name in the current region.
+	// Accepts either a full name (e.g., "kIdk:US-ASHBURN-AD-1") or a suffix (e.g., "US-ASHBURN-AD-1" or "PHX-AD-1").
+	reqAD := strings.TrimSpace(cfg.Spec.AvailabilityDomain)
+	idc, err := identity.NewIdentityClientWithConfigurationProvider(c.Provider)
+	if err != nil {
+		return nil, fmt.Errorf("identity client init: %w", err)
+	}
+	if c.Region != "" {
+		idc.SetRegion(c.Region)
+	}
+	ten, err := c.Provider.TenancyOCID()
+	if err != nil {
+		return nil, fmt.Errorf("resolve tenancy for availability domains: %w", err)
+	}
+	ads, err := idc.ListAvailabilityDomains(ctx, identity.ListAvailabilityDomainsRequest{
+		CompartmentId: &ten,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("list availability domains: %w", err)
+	}
+	if len(ads.Items) == 0 || ads.Items[0].Name == nil {
+		return nil, fmt.Errorf("no availability domains found in region %s", c.Region)
+	}
+	// Default to the first AD, but override if we can match the requested value.
+	ad := *ads.Items[0].Name
+	if reqAD != "" {
+		for _, item := range ads.Items {
+			if item.Name == nil {
+				continue
+			}
+			full := *item.Name
+			if strings.EqualFold(full, reqAD) || strings.HasSuffix(full, reqAD) {
+				ad = full
+				break
+			}
+		}
+	}
+
+	// Resolve subnet ID with optional per-group override
+	subnetID := strings.TrimSpace(cfg.Spec.SubnetID)
+	for _, g := range cfg.Spec.Instances {
+		if g.Name == group && strings.TrimSpace(g.SubnetID) != "" {
+			subnetID = strings.TrimSpace(g.SubnetID)
+			break
+		}
+	}
+	if subnetID == "" {
+		return nil, fmt.Errorf("no subnetId specified (spec.subnetId or instances[%s].subnetId)", group)
+	}
+
+	// Preflight: verify subnet exists and is accessible, and ensure compartment alignment
+	vnc, err := core.NewVirtualNetworkClientWithConfigurationProvider(c.Provider)
+	if err != nil {
+		return nil, fmt.Errorf("virtual network client init: %w", err)
+	}
+	if c.Region != "" {
+		vnc.SetRegion(c.Region)
+	}
+	subnetResp, err := vnc.GetSubnet(ctx, core.GetSubnetRequest{SubnetId: &subnetID})
+	if err != nil {
+		return nil, fmt.Errorf("verify subnet %s: %w", subnetID, err)
+	}
+	if subnetResp.Subnet.CompartmentId != nil && *subnetResp.Subnet.CompartmentId != cfg.Spec.CompartmentID {
+		return nil, fmt.Errorf("subnet %s is in compartment %s but spec.compartmentId is %s", subnetID, *subnetResp.Subnet.CompartmentId, cfg.Spec.CompartmentID)
+	}
+
+	// Preflight: verify image exists in this region
+	if _, err := cc.GetImage(ctx, core.GetImageRequest{ImageId: &cfg.Spec.ImageID}); err != nil {
+		return nil, fmt.Errorf("verify image %s: %w", cfg.Spec.ImageID, err)
+	}
+
+	// ShapeConfig for Flexible shapes
+	var shapeCfg *core.LaunchInstanceShapeConfigDetails
+	if strings.Contains(strings.ToLower(cfg.Spec.Shape), "flex") {
+		if cfg.Spec.ShapeConfig == nil {
+			return nil, fmt.Errorf("shape %q requires shapeConfig (ocpus, memoryInGBs)", cfg.Spec.Shape)
+		}
+		oc := cfg.Spec.ShapeConfig.OCPUs
+		mem := cfg.Spec.ShapeConfig.MemoryInGBs
+		shapeCfg = &core.LaunchInstanceShapeConfigDetails{
+			Ocpus:       &oc,
+			MemoryInGBs: &mem,
+		}
+	}
+
+	for i := 0; i < n; i++ {
+		name := fmt.Sprintf("%s-%d-%d", prefix, time.Now().UnixNano(), i)
+		details := core.LaunchInstanceDetails{
+			CompartmentId:      &cfg.Spec.CompartmentID,
+			AvailabilityDomain: &ad,
+			Shape:              &cfg.Spec.Shape,
+			ShapeConfig:        shapeCfg,
+			SourceDetails: &core.InstanceSourceViaImageDetails{
+				ImageId: &cfg.Spec.ImageID,
+			},
+			CreateVnicDetails: &core.CreateVnicDetails{
+				SubnetId: &subnetID,
+			},
+			DisplayName:  &name,
+			FreeformTags: cfg.Spec.FreeformTags,
+			// NOTE: DefinedTags in OCI SDK require map[string]map[string]interface{}; skipped initially.
+		}
+		log.Printf("Launch: requesting %s (group=%s, shape=%s, ad=%s, subnet=%s)", name, group, cfg.Spec.Shape, ad, subnetID)
+		req := core.LaunchInstanceRequest{LaunchInstanceDetails: details}
+		resp, err := cc.LaunchInstance(ctx, req)
+		if err != nil {
+			return nil, fmt.Errorf("launch instance %d/%d: %w", i+1, n, err)
+		}
+		ii := InstanceInfo{DisplayName: name}
+		if resp.Instance.Id != nil {
+			ii.ID = *resp.Instance.Id
+		}
+		log.Printf("Launch: requested %s id=%s", name, ii.ID)
+		// Wait for completion: prefer Work Request if present; otherwise poll until RUNNING
+		if resp.OpcWorkRequestId != nil {
+			if err := c.waitWorkRequest(ctx, *resp.OpcWorkRequestId, fmt.Sprintf("launch %s", ii.ID)); err != nil {
+				return nil, fmt.Errorf("wait for launch %s: %w", ii.ID, err)
+			}
+		} else if ii.ID != "" {
+			if err := c.waitInstanceState(ctx, ii.ID, core.InstanceLifecycleStateRunning); err != nil {
+				return nil, fmt.Errorf("wait running %s: %w", ii.ID, err)
+			}
+		}
+		if resp.Instance.LifecycleState != "" {
+			ii.Lifecycle = string(resp.Instance.LifecycleState)
+		}
+		out = append(out, ii)
+	}
+	return out, nil
+}
+
+// TerminateInstances terminates the specified OCI instances.
+func (c *Client) TerminateInstances(ctx context.Context, ids []string) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	if c == nil || c.Provider == nil {
+		return fmt.Errorf("client not initialized")
+	}
+	cc, err := core.NewComputeClientWithConfigurationProvider(c.Provider)
+	if err != nil {
+		return fmt.Errorf("compute client init: %w", err)
+	}
+	if c.Region != "" {
+		cc.SetRegion(c.Region)
+	}
+
+	for _, id := range ids {
+		if id == "" {
+			continue
+		}
+		log.Printf("Terminate: requesting instance %s", id)
+		_, err := cc.TerminateInstance(ctx, core.TerminateInstanceRequest{InstanceId: &id})
+		if err != nil {
+			return fmt.Errorf("terminate instance %s: %w", id, err)
+		}
+		log.Printf("Terminate: requested instance %s", id)
+		// Wait for completion by polling lifecycle to TERMINATED
+		if err := c.waitInstanceState(ctx, id, core.InstanceLifecycleStateTerminated); err != nil {
+			return fmt.Errorf("wait terminated %s: %w", id, err)
+		}
+	}
+	return nil
+}
+
 // Validate performs a lightweight API call to verify auth works.
 func (c *Client) Validate(ctx context.Context) error {
 	_, err := c.ValidateInfo(ctx)
 	return err
+}
+
+// stringMapToAnyMap converts map[string]string to map[string]interface{} for SDK tag fields expecting interface{}.
+func stringMapToAnyMap(in map[string]string) map[string]interface{} {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]interface{}, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
 }

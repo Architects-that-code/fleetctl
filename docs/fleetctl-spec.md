@@ -16,8 +16,8 @@ Current Implementation Snapshot (as of v0.1.0)
 - CLI entrypoint: cmd/fleetctl/main.go
   - Flags:
     - --config string (default: fleet.yaml)
-    - --scale int (desired total instances, stubbed)
-    - --rolling-restart (bool, stubbed)
+    - --scale int (desired total instances)
+    - --rolling-restart (bool)
     - --auth-validate (bool) validate auth and print details
     - --status (bool) print tracked fleet state and exit
     - --state string path to local state JSON (default ".fleetctl/state.json")
@@ -25,8 +25,7 @@ Current Implementation Snapshot (as of v0.1.0)
   - Default behavior: loads config and prints a human-friendly summary (when no action flags).
 - Config loader: internal/config
   - config.ParseFile reads YAML into FleetConfig struct.
-  - Struct currently includes: kind, metadata.name, spec.{compartmentId, imageId, definedTags, freeformTags, instances[]}
-  - Struct also includes spec.availabilityDomain.
+  - Struct currently includes: kind, metadata.name, spec.{compartmentId, imageId, availabilityDomain, shape, subnetId, displayNamePrefix, definedTags, freeformTags, instances[]}
 - Client: internal/client
   - New(auth) initializes an OCI ConfigurationProvider based on spec.auth:
     - method: "user" uses OCI CLI config file/profile
@@ -44,7 +43,7 @@ Current Implementation Snapshot (as of v0.1.0)
 - Fleet logic: internal/fleet
   - New(cfg, client) constructs Fleet.
   - Summary() returns a string summary of the loaded config.
-  - Scale() and RollingRestart() are stubbed and log requested actions.
+  - Scale() launches/terminates OCI instances via Compute; RollingRestart() replaces instances one-by-one.
 - Build/Run
   - make build produces ./bin/fleetctl
   - make run ARGS="--config fleet.yaml" runs the CLI
@@ -105,6 +104,9 @@ Configuration Specification (fleet.yaml)
   - compartmentId (string) — OCI compartment OCID
   - imageId (string) — OCI image OCID
   - availabilityDomain (string) — e.g., PHX-AD-1
+  - shape (string) — compute shape (e.g., VM.Standard.E2.1.Micro)
+  - subnetId (string) — OCID of subnet for the primary VNIC
+  - displayNamePrefix (string, optional) — prefix for instance display names
   - auth (object)
     - method: "instance" (default) or "user"
     - configFile (user only): path to OCI config, default ~/.oci/config
@@ -115,6 +117,11 @@ Configuration Specification (fleet.yaml)
   - instances (array of InstanceSpec)
     - name (string) — logical name/group identifier
     - count (int) — baseline count for the group
+    - subnetId (string, optional) — per-group subnet override
+Subnet selection precedence
+- instances[].subnetId (if set for the matched group)
+- spec.subnetId
+
 Notes:
 - Additional fields will be added as needed (shape, subnet, VCN, metadata, boot volume size, etc.).
 - Unknown fields should be preserved in doc/spec and added to struct as we implement.
@@ -141,9 +148,9 @@ Examples
 - Print summary
   - make run ARGS="--config fleet.yaml"
   - Output: Fleet(kind=FleetConfig, name=dev-fleet, instances=1)
-- Scale to 3 (stubbed behavior today)
+- Scale to 3 (performs real OCI operations)
   - make run ARGS="--config fleet.yaml --scale 3"
-- Rolling restart (stubbed behavior today)
+- Rolling restart (performs real OCI operations)
   - make run ARGS="--config fleet.yaml --rolling-restart"
 - Auth validate (prints details)
   - make run ARGS="--config fleet.yaml --auth-validate"
@@ -183,7 +190,7 @@ State Tracking
 - Purpose: Maintain a local ledger of instances created/terminated by fleetctl; not an authoritative OCI source of truth.
 - Storage: JSON file at ".fleetctl/state.json" (override via --state).
 - Scope: Only tracks resources managed via this CLI on the local machine; does not discover pre-existing instances.
-- API (internal/state): AddActiveInstances, RemoveActiveInstances, CountActive, Summary.
+- API (internal/state): AddActiveInstances, RemoveActiveInstances, CountActive, Summary, AddActiveRecord, ActiveRecordsLIFO, MarkTerminatedByIDs.
 - Behavior:
   - scale N updates tracked state to match N
   - --status prints a human-readable summary grouped by instance group
@@ -224,6 +231,10 @@ Change Log
 - 2025-11-23
   - Enhanced --auth-validate to return and print details (region, tenancy, user, region subscriptions).
   - Updated README and Current Implementation Snapshot with --status, --state, --auth-validate.
+- 2025-11-26
+  - Implemented real Scale (OCI launch/terminate) and RollingRestart (one-by-one replacement).
+  - Added new config fields: spec.shape, spec.subnetId, spec.displayNamePrefix; updated schema and templates.
+  - Extended state store (AddActiveRecord, ActiveRecordsLIFO, MarkTerminatedByIDs) and client (Compute methods).
 
 Maintenance Policy
 - Update this document with any user-visible behavior changes (flags, commands, config schema) as part of each PR.
