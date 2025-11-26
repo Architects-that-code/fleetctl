@@ -1,0 +1,44 @@
+# yaml-language-server: $schema=../schema/fleetctl.schema.json
+# FleetCTL local development configuration template
+# Use this when running on a workstation where Instance Principal auth is not available.
+
+kind: FleetConfig
+metadata:
+  # Human-friendly name for this local fleet
+  name: local-dev-fleet
+spec:
+  # REQUIRED: OCI Compartment OCID where instances would be managed
+  compartmentId: "<oci_compartment_ocid>"
+
+  # REQUIRED: OCI Image OCID to use when creating instances
+  imageId: "<oci_image_ocid>"
+
+  # OPTIONAL: Availability Domain (e.g., PHX-AD-1)
+  availabilityDomain: "PHX-AD-1"
+
+  # Authentication for OCI SDK (local workstation uses user principal)
+  auth:
+    # Local development: use the OCI CLI config file + profile
+    method: user
+    # Path to your OCI CLI config
+    configFile: "~/.oci/config"
+    # Profile to use within the OCI CLI config
+    profile: "DEFAULT"
+    # Optional region override. If unset, uses OCI_REGION env or provider region.
+    # Set this explicitly for deterministic behavior on a workstation:
+    region: "us-phoenix-1"
+
+  # OPTIONAL: Defined tags (namespace-scoped)
+  definedTags:
+    # "namespace.key": "value"
+
+  # OPTIONAL: Freeform tags
+  freeformTags:
+    # "key": "value"
+
+  # REQUIRED: One or more instance groups
+  # For local testing of commands (e.g., --auth-validate, --status), keep counts at 0
+  # to avoid provisioning actions until scale logic is implemented against OCI.
+  instances:
+    - name: web
+      count: 0

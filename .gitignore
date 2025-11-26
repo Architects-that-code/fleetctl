@@ -1,0 +1,22 @@
+# Build artifacts
+bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Go coverage
+coverage.out
+
+# FleetCTL local state (do not commit)
+.fleetctl/
+
+# macOS
+.DS_Store
+
+# IDE/editor
+.vscode/
+.idea/

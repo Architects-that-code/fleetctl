@@ -1,0 +1,43 @@
+# yaml-language-server: $schema=../schema/fleetctl.schema.json
+# FleetCTL configuration template
+# Copy this file to your working directory as fleet.yaml and edit values as needed.
+
+kind: FleetConfig
+metadata:
+  # Human-friendly name for this fleet
+  name: your-fleet-name
+spec:
+  # REQUIRED: OCI Compartment OCID where instances will be managed
+  compartmentId: "<oci_compartment_ocid>"
+
+  # REQUIRED: OCI Image OCID to use when creating instances
+  imageId: "<oci_image_ocid>"
+
+  # OPTIONAL: Availability Domain (e.g., PHX-AD-1)
+  availabilityDomain: "PHX-AD-1"
+
+  # Authentication for OCI SDK
+  auth:
+    # method: "instance" uses Instance Principal auth (default)
+    # method: "user" uses the OCI CLI config file and profile below
+    method: instance
+    # Only used when method: user
+    configFile: "~/.oci/config"
+    profile: "DEFAULT"
+    # Optional region override; if unset uses OCI_REGION env or provider region
+    region: ""
+
+  # OPTIONAL: Defined tags (namespace-scoped)
+  definedTags:
+    # "namespace.key": "value"
+
+  # OPTIONAL: Freeform tags
+  freeformTags:
+    # "key": "value"
+
+  # REQUIRED: One or more instance groups
+  instances:
+    - name: web
+      count: 2
+    # - name: worker
+    #   count: 3

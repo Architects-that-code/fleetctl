@@ -1,3 +1,4 @@
+# yaml-language-server: $schema=./schema/fleetctl.schema.json
 kind: FleetConfig
 metadata:
   name: dev-fleet
@@ -5,6 +6,15 @@ spec:
   compartmentId: ocid1.compartments.oc1..example..aaaaaaa
   imageId: ocid1.image.oc1..example..bbbbbbbbb
   availabilityDomain: PHX-AD-1
+  auth:
+    # method: "instance" uses Instance Principal auth (default)
+    # method: "user" uses the OCI CLI config file and profile below
+    method: instance
+    # configFile and profile are only used when method: user
+    configFile: "~/.oci/config"
+    profile: "DEFAULT"
+    # optional region override; if unset uses OCI_REGION env or provider region
+    region: ""
   definedTags: {}
   freeformTags: {}
   instances:
