@@ -32,6 +32,7 @@
         "imageId",
         "shape",
         "subnetId",
+        "scaling",
         "instances"
       ],
       "properties": {
@@ -83,6 +84,27 @@
         "displayNamePrefix": {
           "type": "string",
           "description": "Optional prefix for instance display names (default: <fleet>-<group>)"
+        },
+        "scaling": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Bounded concurrency settings for scaling operations",
+          "required": [
+            "parallelLaunch",
+            "parallelTerminate"
+          ],
+          "properties": {
+            "parallelLaunch": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Maximum number of instances to launch concurrently (default 5 if unset)"
+            },
+            "parallelTerminate": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Maximum number of instances to terminate concurrently (default 10 if unset)"
+            }
+          }
         },
         "auth": {
           "type": "object",

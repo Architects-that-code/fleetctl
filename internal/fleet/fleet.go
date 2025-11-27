@@ -5,7 +5,9 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strings"
 	"sync"
+	"time"
 
 	"fleetctl/internal/client"
 	"fleetctl/internal/config"
@@ -66,7 +68,12 @@ func (f *Fleet) Scale(desiredTotal int) error {
 		}
 		resCh := make(chan launchRes, missing)
 		var wg sync.WaitGroup
-		sem := make(chan struct{}, 5) // limit parallel launches
+		// bounded concurrency from config (fallback to default 5)
+		parLaunch := f.Config.Spec.Scaling.ParallelLaunch
+		if parLaunch <= 0 {
+			parLaunch = 5
+		}
+		sem := make(chan struct{}, parLaunch)
 
 		for i := 0; i < missing; i++ {
 			wg.Add(1)
@@ -118,7 +125,12 @@ func (f *Fleet) Scale(desiredTotal int) error {
 	// Terminate instances in parallel with bounded concurrency, then mark terminated
 	var twg sync.WaitGroup
 	terrCh := make(chan error, len(ids))
-	tsem := make(chan struct{}, 10)
+	// bounded concurrency from config (fallback to default 10)
+	parTerminate := f.Config.Spec.Scaling.ParallelTerminate
+	if parTerminate <= 0 {
+		parTerminate = 10
+	}
+	tsem := make(chan struct{}, parTerminate)
 
 	for _, id := range ids {
 		id := id
@@ -147,6 +159,114 @@ func (f *Fleet) Scale(desiredTotal int) error {
 	}
 	log.Printf("Scale: terminated %d instances to reach %d", len(ids), desiredTotal)
 	return nil
+}
+
+// SyncState queries OCI for instances tagged to this fleet and rebuilds local state.
+func (f *Fleet) verifyActualMatches(ctx context.Context, desired int) error {
+	if f.Client == nil {
+		return fmt.Errorf("OCI client not initialized")
+	}
+	fleetName := f.Config.Metadata.Name
+	deadline := time.Now().Add(2 * time.Minute)
+	for {
+		instances, err := f.Client.ListInstancesByFleet(ctx, f.Config.Spec.CompartmentID, fleetName)
+		if err != nil {
+			return fmt.Errorf("verify actual count: %w", err)
+		}
+		actual := len(instances)
+		if actual == desired {
+			log.Printf("Scale verify: actual active=%d matches desired=%d", actual, desired)
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("scale verify timeout: actual=%d desired=%d", actual, desired)
+		}
+		time.Sleep(2 * time.Second)
+	}
+}
+
+func (f *Fleet) SyncState() error {
+	if f.Client == nil {
+		return fmt.Errorf("OCI client not initialized")
+	}
+	ctx := context.Background()
+	fleetName := f.Config.Metadata.Name
+
+	instances, err := f.Client.ListInstancesByFleet(ctx, f.Config.Spec.CompartmentID, fleetName)
+	if err != nil {
+		return fmt.Errorf("list fleet instances: %w", err)
+	}
+
+	now := time.Now()
+	records := make([]state.InstanceRecord, 0, len(instances))
+	for _, it := range instances {
+		// Best-effort group parsing from display name: <fleet>-<group>-<timestamp>-<idx>
+		group := "default"
+		prefix := f.Config.Spec.DisplayNamePrefix
+		if strings.TrimSpace(prefix) == "" {
+			prefix = f.Config.Metadata.Name + "-"
+		}
+		if strings.HasPrefix(it.DisplayName, prefix) {
+			rest := strings.TrimPrefix(it.DisplayName, prefix)
+			if idx := strings.Index(rest, "-"); idx > 0 {
+				group = rest[:idx]
+			}
+		}
+
+		records = append(records, state.InstanceRecord{
+			ID:        it.ID,
+			Group:     group,
+			Name:      it.DisplayName,
+			Status:    state.StatusActive,
+			CreatedAt: now, // unknown; set to now for reconstruction
+			UpdatedAt: now,
+		})
+	}
+
+	if err := f.Store.ResetFleetActive(fleetName, records); err != nil {
+		return fmt.Errorf("reset state: %w", err)
+	}
+	log.Printf("SyncState: rebuilt state for fleet %q with %d active instances", fleetName, len(records))
+	return nil
+}
+
+// StatusCompare returns a composite status including clearly labeled local and remote (OCI) counts,
+// plus local detailed summary, and drift indication if counts differ.
+func (f *Fleet) StatusCompare() (string, error) {
+	if f.Client == nil {
+		return "", fmt.Errorf("OCI client not initialized")
+	}
+	ctx := context.Background()
+	fleetName := f.Config.Metadata.Name
+
+	// Local summary and counts
+	localSummary, err := f.Store.Summary(fleetName)
+	if err != nil {
+		return "", fmt.Errorf("local summary: %w", err)
+	}
+	localActive, err := f.Store.CountActive(fleetName)
+	if err != nil {
+		return "", fmt.Errorf("local active: %w", err)
+	}
+
+	// Remote/actual counts via fleet tag
+	actual, err := f.Client.ListInstancesByFleet(ctx, f.Config.Spec.CompartmentID, fleetName)
+	if err != nil {
+		return "", fmt.Errorf("actual list: %w", err)
+	}
+	remoteActive := len(actual)
+
+	out := fmt.Sprintf("Status for fleet %q:\n", fleetName)
+	out += fmt.Sprintf("  Local active:  %d\n", localActive)
+	out += fmt.Sprintf("  Remote active: %d\n\n", remoteActive)
+	out += "Local state detail:\n" + localSummary
+
+	if localActive != remoteActive {
+		out += fmt.Sprintf("\n\nDrift detected: local=%d actual=%d", localActive, remoteActive)
+	} else {
+		out += "\n\nLocal and actual counts match."
+	}
+	return out, nil
 }
 
 // RollingRestart performs a simple one-by-one replacement of active instances.

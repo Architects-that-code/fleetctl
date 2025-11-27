@@ -1,0 +1,9 @@
+{
+  "fleets": {
+    "local-dev-fleet": {
+      "fleetName": "local-dev-fleet",
+      "instances": [],
+      "updatedAt": "2025-11-26T19:13:30.186375-05:00"
+    }
+  }
+}

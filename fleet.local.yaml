@@ -23,6 +23,9 @@ spec:
     memoryInGBs: 16
   # REQUIRED: Subnet OCID for the primary VNIC (default for groups unless overridden)
   subnetId: "ocid1.subnet.oc1.iad.aaaaaaaa3mjqpf4ddhccc4mdgwsj3bgotl5w2l72lc447zo3qzx4smsadexa"
+  scaling:
+    parallelLaunch: 100
+    parallelTerminate: 10
 
   # Authentication for OCI SDK (local workstation uses user principal)
   auth:

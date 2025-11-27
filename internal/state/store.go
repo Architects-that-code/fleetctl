@@ -324,3 +324,29 @@ func (s *Store) MarkTerminatedByIDs(fleetName string, ids []string) error {
 	r.Fleets[fleetName] = fs
 	return s.save(r)
 }
+
+// ResetFleetActive replaces the fleet's tracked instances with the provided active records.
+func (s *Store) ResetFleetActive(fleetName string, records []InstanceRecord) error {
+	now := time.Now()
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	r, err := s.load()
+	if err != nil {
+		return err
+	}
+	for i := range records {
+		records[i].Status = StatusActive
+		if records[i].CreatedAt.IsZero() {
+			records[i].CreatedAt = now
+		}
+		records[i].UpdatedAt = now
+	}
+	r.Fleets[fleetName] = FleetState{
+		FleetName: fleetName,
+		Instances: records,
+		UpdatedAt: now,
+	}
+	return s.save(r)
+}

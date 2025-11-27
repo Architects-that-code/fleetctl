@@ -27,6 +27,7 @@ type Spec struct {
 	ShapeConfig        *ShapeConfig `yaml:"shapeConfig"` // required when using Flex shapes
 	SubnetID           string       `yaml:"subnetId"`
 	DisplayNamePrefix  string       `yaml:"displayNamePrefix"`
+	Scaling            Scaling      `yaml:"scaling"` // optional scaling configuration (bounded concurrency)
 	Auth               Auth         `yaml:"auth"`
 	// ... other fields
 	DefinedTags  map[string]string `yaml:"definedTags"` // or a more complex type
@@ -44,6 +45,12 @@ type InstanceSpec struct {
 type ShapeConfig struct {
 	OCPUs       float32 `yaml:"ocpus"`
 	MemoryInGBs float32 `yaml:"memoryInGBs"`
+}
+
+// Scaling controls bounded concurrency for scale operations.
+type Scaling struct {
+	ParallelLaunch    int `yaml:"parallelLaunch"`    // max concurrent launches; default applied if zero
+	ParallelTerminate int `yaml:"parallelTerminate"` // max concurrent terminations; default applied if zero
 }
 
 type Auth struct {

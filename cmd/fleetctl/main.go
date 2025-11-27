@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"fleetctl/internal/client"
@@ -25,6 +26,7 @@ var (
 	flagStatus         bool
 	flagState          string
 	flagAuthValidate   bool
+	flagSyncState      bool
 )
 
 func init() {
@@ -35,6 +37,7 @@ func init() {
 	flag.BoolVar(&flagStatus, "status", false, "Print tracked fleet state from local store")
 	flag.StringVar(&flagState, "state", ".fleetctl/state.json", "Path to local state JSON for tracking launched instances")
 	flag.BoolVar(&flagAuthValidate, "auth-validate", false, "Validate OCI authentication by performing a lightweight API call")
+	flag.BoolVar(&flagSyncState, "sync-state", false, "Rebuild local state by querying OCI for instances tagged to this fleet")
 
 	// Custom usage printer
 	flag.Usage = func() {
@@ -71,10 +74,31 @@ func main() {
 		log.Fatalf("failed to load configuration from %s: %v", flagConfig, err)
 	}
 
-	st := state.New(flagState)
+	// Resolve default state path to be alongside the config file and reflect the fleet name, unless overridden.
+	statePath := flagState
+	cfgDir := filepath.Dir(flagConfig)
+	if statePath == ".fleetctl/state.json" {
+		base := fmt.Sprintf(".%s.state.json", cfg.Metadata.Name)
+		statePath = filepath.Join(cfgDir, base)
+	}
+	st := state.New(statePath)
 	f := fleet.New(*cfg, nil, st)
 
 	switch {
+	case flagSyncState:
+		stubClient, err := client.New(cfg.Spec.Auth)
+		if err != nil {
+			log.Fatalf("init OCI client: %v", err)
+		}
+		f.Client = stubClient
+		if err := f.SyncState(); err != nil {
+			log.Fatalf("sync-state failed: %v", err)
+		}
+		summary, err := st.Summary(cfg.Metadata.Name)
+		if err != nil {
+			log.Fatalf("status after sync failed: %v", err)
+		}
+		fmt.Println(summary)
 	case flagAuthValidate:
 		cli, err := client.New(cfg.Spec.Auth)
 		if err != nil {
@@ -121,11 +145,20 @@ func main() {
 			log.Fatalf("rolling restart failed: %v", err)
 		}
 	case flagStatus:
-		summary, err := st.Summary(cfg.Metadata.Name)
+		// Ensure OCI client available for remote status
+		if f.Client == nil {
+			cli, err := client.New(cfg.Spec.Auth)
+			if err != nil {
+				log.Fatalf("init OCI client: %v", err)
+			}
+			f.Client = cli
+		}
+		// Use Fleet.StatusCompare to print clearly labeled local vs remote sections
+		out, err := f.StatusCompare()
 		if err != nil {
 			log.Fatalf("status failed: %v", err)
 		}
-		fmt.Println(summary)
+		fmt.Println(out)
 	default:
 		// If only --config (or other non-action flags) are provided, print a summary by default.
 		fmt.Println(f.Summary())

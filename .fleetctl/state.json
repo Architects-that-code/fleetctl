@@ -135,28 +135,28 @@
           "id": "ocid1.instance.oc1.iad.anuwcljtk475dqqcauaf3agkiqhn5uja4bfgpi35qahnibdpjzlsqlhe75va",
           "group": "web",
           "name": "local-dev-fleet-web-1764171987263438000-0",
-          "status": "Active",
+          "status": "Terminated",
           "createdAt": "2025-11-26T10:47:01.185745-05:00",
-          "updatedAt": "2025-11-26T10:47:01.185745-05:00"
+          "updatedAt": "2025-11-26T18:56:16.336311-05:00"
         },
         {
           "id": "ocid1.instance.oc1.iad.anuwcljtk475dqqca5e7qse44nehph7q5fzlegrnmpjcrkxp6xfjqdyoo6xa",
           "group": "web",
           "name": "local-dev-fleet-web-1764172069520472000-0",
-          "status": "Active",
+          "status": "Terminated",
           "createdAt": "2025-11-26T10:48:22.405641-05:00",
-          "updatedAt": "2025-11-26T10:48:22.405641-05:00"
+          "updatedAt": "2025-11-26T18:56:16.336311-05:00"
         },
         {
           "id": "ocid1.instance.oc1.iad.anuwcljtk475dqqcplo5jhu7kfam6cfyhpbbftyaosas6i6bbh3cspc33sqa",
           "group": "web",
           "name": "local-dev-fleet-web-1764172159672677000-0",
-          "status": "Active",
+          "status": "Terminated",
           "createdAt": "2025-11-26T10:49:51.651485-05:00",
-          "updatedAt": "2025-11-26T10:49:51.651485-05:00"
+          "updatedAt": "2025-11-26T18:56:16.336311-05:00"
         }
       ],
-      "updatedAt": "2025-11-26T10:49:51.651485-05:00"
+      "updatedAt": "2025-11-26T18:56:16.336311-05:00"
     }
   }
 }

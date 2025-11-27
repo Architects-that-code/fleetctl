@@ -26,6 +26,9 @@ type Client struct {
 	Region   string
 }
 
+// FleetTagKey is the freeform tag key used to mark instances for a given fleet.
+const FleetTagKey = "fleetctl-fleet"
+
 // AuthInfo captures details discovered during auth validation.
 type AuthInfo struct {
 	Region            string
@@ -347,6 +350,13 @@ func (c *Client) LaunchInstances(ctx context.Context, cfg config.FleetConfig, gr
 
 	for i := 0; i < n; i++ {
 		name := fmt.Sprintf("%s-%d-%d", prefix, time.Now().UnixNano(), i)
+		// Merge user-provided freeform tags with our fleet tag
+		ftags := map[string]string{}
+		for k, v := range cfg.Spec.FreeformTags {
+			ftags[k] = v
+		}
+		ftags[FleetTagKey] = cfg.Metadata.Name
+
 		details := core.LaunchInstanceDetails{
 			CompartmentId:      &cfg.Spec.CompartmentID,
 			AvailabilityDomain: &ad,
@@ -359,7 +369,7 @@ func (c *Client) LaunchInstances(ctx context.Context, cfg config.FleetConfig, gr
 				SubnetId: &subnetID,
 			},
 			DisplayName:  &name,
-			FreeformTags: cfg.Spec.FreeformTags,
+			FreeformTags: ftags,
 			// NOTE: DefinedTags in OCI SDK require map[string]map[string]interface{}; skipped initially.
 		}
 		log.Printf("Launch: requesting %s (group=%s, shape=%s, ad=%s, subnet=%s)", name, group, cfg.Spec.Shape, ad, subnetID)
@@ -387,6 +397,59 @@ func (c *Client) LaunchInstances(ctx context.Context, cfg config.FleetConfig, gr
 			ii.Lifecycle = string(resp.Instance.LifecycleState)
 		}
 		out = append(out, ii)
+	}
+	return out, nil
+}
+
+// TerminateInstances terminates the specified OCI instances.
+func (c *Client) ListInstancesByFleet(ctx context.Context, compartmentId, fleetName string) ([]InstanceInfo, error) {
+	if c == nil || c.Provider == nil {
+		return nil, fmt.Errorf("client not initialized")
+	}
+	cc, err := core.NewComputeClientWithConfigurationProvider(c.Provider)
+	if err != nil {
+		return nil, fmt.Errorf("compute client init: %w", err)
+	}
+	if c.Region != "" {
+		cc.SetRegion(c.Region)
+	}
+
+	var out []InstanceInfo
+	var page *string
+	for {
+		resp, err := cc.ListInstances(ctx, core.ListInstancesRequest{
+			CompartmentId: &compartmentId,
+			Page:          page,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("list instances: %w", err)
+		}
+		for _, it := range resp.Items {
+			// Skip terminated
+			if it.LifecycleState == core.InstanceLifecycleStateTerminated {
+				continue
+			}
+			// Match our fleet tag
+			if it.FreeformTags != nil {
+				if val, ok := it.FreeformTags[FleetTagKey]; ok && val == fleetName {
+					info := InstanceInfo{}
+					if it.Id != nil {
+						info.ID = *it.Id
+					}
+					if it.DisplayName != nil {
+						info.DisplayName = *it.DisplayName
+					}
+					if it.LifecycleState != "" {
+						info.Lifecycle = string(it.LifecycleState)
+					}
+					out = append(out, info)
+				}
+			}
+		}
+		if resp.OpcNextPage == nil || *resp.OpcNextPage == "" {
+			break
+		}
+		page = resp.OpcNextPage
 	}
 	return out, nil
 }
@@ -429,16 +492,4 @@ func (c *Client) TerminateInstances(ctx context.Context, ids []string) error {
 func (c *Client) Validate(ctx context.Context) error {
 	_, err := c.ValidateInfo(ctx)
 	return err
-}
-
-// stringMapToAnyMap converts map[string]string to map[string]interface{} for SDK tag fields expecting interface{}.
-func stringMapToAnyMap(in map[string]string) map[string]interface{} {
-	if len(in) == 0 {
-		return nil
-	}
-	out := make(map[string]interface{}, len(in))
-	for k, v := range in {
-		out[k] = v
-	}
-	return out
 }
