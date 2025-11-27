@@ -22,3 +22,4 @@ coverage.out
 .idea/
 .local-dev-fleet.state.json
 fleet.local.yaml
+fleet.local.yaml
