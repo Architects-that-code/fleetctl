@@ -31,6 +31,7 @@ var (
 	flagAuthValidate   bool
 	flagSyncState      bool
 	flagHTTP           string
+	flagReconcileEvery time.Duration
 )
 
 func init() {
@@ -43,6 +44,7 @@ func init() {
 	flag.BoolVar(&flagAuthValidate, "auth-validate", false, "Validate OCI authentication by performing a lightweight API call")
 	flag.BoolVar(&flagSyncState, "sync-state", false, "Rebuild local state by querying OCI for instances tagged to this fleet")
 	flag.StringVar(&flagHTTP, "http", "", "Listen address for HTTP API (e.g., :8080). Serves /healthz, /status, /metrics and command endpoints.")
+	flag.DurationVar(&flagReconcileEvery, "reconcile-every", 30*time.Second, "Background reconcile interval for --http mode (e.g., 30s, 1m)")
 
 	// Custom usage printer
 	flag.Usage = func() {
@@ -104,6 +106,8 @@ func main() {
 		if !strings.Contains(addr, ":") {
 			addr = ":" + addr
 		}
+		log.Printf("Starting control loop every %s (config: %s)", flagReconcileEvery, flagConfig)
+		startControlLoop(f, flagConfig, flagReconcileEvery)
 		log.Printf("Starting HTTP server on %s", addr)
 		if err := startHTTPServer(f, st, cfg, addr); err != nil {
 			log.Fatalf("http server error: %v", err)
@@ -292,6 +296,58 @@ func startHTTPServer(f *fleet.Fleet, st *state.Store, cfg *config.FleetConfig, a
 		Handler: mux,
 	}
 	return server.ListenAndServe()
+}
+
+func startControlLoop(f *fleet.Fleet, cfgPath string, every time.Duration) {
+	go func() {
+		ticker := time.NewTicker(every)
+		defer ticker.Stop()
+
+		var lastMod time.Time
+
+		for {
+			// 1) Reload config if modified
+			if fi, err := os.Stat(cfgPath); err == nil {
+				if fi.ModTime().After(lastMod) {
+					if newCfg, err := config.ParseFile(cfgPath); err == nil {
+						f.Config = *newCfg
+						lastMod = fi.ModTime()
+						log.Printf("control: reloaded config (modified %s)", fi.ModTime().Format(time.RFC3339))
+					} else {
+						log.Printf("control: parse config error: %v", err)
+					}
+				}
+			} else {
+				log.Printf("control: stat config error: %v", err)
+			}
+
+			// 2) Determine desired total from config
+			desired := 0
+			for _, g := range f.Config.Spec.Instances {
+				desired += g.Count
+			}
+
+			// 3) Compare actual vs desired and reconcile if needed
+			if f.Client != nil {
+				inst, err := f.Client.ListInstancesByFleet(context.Background(), f.Config.Spec.CompartmentID, f.Config.Metadata.Name)
+				if err != nil {
+					log.Printf("control: list instances error: %v", err)
+				} else {
+					actual := len(inst)
+					if actual != desired {
+						log.Printf("control: reconciling desired=%d actual=%d", desired, actual)
+						if err := f.Scale(desired); err != nil {
+							log.Printf("control: scale to %d failed: %v", desired, err)
+						}
+					} else {
+						log.Printf("control: desired matches actual (%d); no action", actual)
+					}
+				}
+			}
+
+			<-ticker.C
+		}
+	}()
 }
 
 // openAPISpecJSON returns the OpenAPI 3.0 definition for the HTTP API.

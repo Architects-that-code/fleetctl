@@ -2,8 +2,33 @@
   "fleets": {
     "local-dev-fleet": {
       "fleetName": "local-dev-fleet",
-      "instances": [],
-      "updatedAt": "2025-11-26T19:13:30.186375-05:00"
+      "instances": [
+        {
+          "id": "ocid1.instance.oc1.iad.anuwcljtk475dqqcbwmj2eackijhcckifzzanb7abt3vjeya7d67pxj44xaa",
+          "group": "web",
+          "name": "local-dev-fleet-web-1764254752237666000-0",
+          "status": "Active",
+          "createdAt": "2025-11-27T09:47:49.464396-05:00",
+          "updatedAt": "2025-11-27T09:47:49.464399-05:00"
+        },
+        {
+          "id": "ocid1.instance.oc1.iad.anuwcljtk475dqqc4vfdufvlgzbvenwo2rruuaht4y5ovemvcmzgnlsgkika",
+          "group": "web",
+          "name": "local-dev-fleet-web-1764254752253877000-0",
+          "status": "Active",
+          "createdAt": "2025-11-27T09:47:49.464396-05:00",
+          "updatedAt": "2025-11-27T09:47:49.464399-05:00"
+        },
+        {
+          "id": "ocid1.instance.oc1.iad.anuwcljtk475dqqc2t3a5iubc2gjo2qqhsemoxhf2nyfefrx2y4f26ei3pia",
+          "group": "web",
+          "name": "local-dev-fleet-web-1764254752292441000-0",
+          "status": "Active",
+          "createdAt": "2025-11-27T09:47:49.464396-05:00",
+          "updatedAt": "2025-11-27T09:47:49.464399-05:00"
+        }
+      ],
+      "updatedAt": "2025-11-27T09:47:49.464399-05:00"
     }
   }
 }
