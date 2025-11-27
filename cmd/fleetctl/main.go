@@ -99,8 +99,13 @@ func main() {
 			}
 			f.Client = cli
 		}
-		log.Printf("Starting HTTP server on %s", flagHTTP)
-		if err := startHTTPServer(f, st, cfg, flagHTTP); err != nil {
+		// Normalize address: allow bare port like "8080" by prefixing with ":"
+		addr := flagHTTP
+		if !strings.Contains(addr, ":") {
+			addr = ":" + addr
+		}
+		log.Printf("Starting HTTP server on %s", addr)
+		if err := startHTTPServer(f, st, cfg, addr); err != nil {
 			log.Fatalf("http server error: %v", err)
 		}
 	case flagSyncState:
@@ -272,9 +277,219 @@ func startHTTPServer(f *fleet.Fleet, st *state.Store, cfg *config.FleetConfig, a
 		_, _ = w.Write([]byte("sync-state OK"))
 	})
 
+	// Serve OpenAPI spec and basic UI
+	mux.HandleFunc("/openapi.json", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(openAPISpecJSON()))
+	})
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = w.Write([]byte(uiPageHTML()))
+	})
+
 	server := &http.Server{
 		Addr:    addr,
 		Handler: mux,
 	}
 	return server.ListenAndServe()
+}
+
+// openAPISpecJSON returns the OpenAPI 3.0 definition for the HTTP API.
+func openAPISpecJSON() string {
+	return `{
+  "openapi": "3.0.0",
+  "info": {
+    "title": "fleetctl API",
+    "version": "0.1.0",
+    "description": "HTTP API for fleetctl daemon: health, status, metrics, and control operations"
+  },
+  "paths": {
+    "/healthz": {
+      "get": {
+        "summary": "Liveness probe",
+        "responses": {
+          "200": { "description": "OK", "content": { "text/plain": { } } }
+        }
+      }
+    },
+    "/status": {
+      "get": {
+        "summary": "Local vs Remote (OCI) status",
+        "responses": {
+          "200": { "description": "Status text", "content": { "text/plain": { } } },
+          "500": { "description": "Error", "content": { "text/plain": { } } }
+        }
+      }
+    },
+    "/metrics": {
+      "get": {
+        "summary": "Metrics JSON",
+        "responses": {
+          "200": {
+            "description": "Metrics",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "fleet": { "type": "string" },
+                    "localActive": { "type": "integer" },
+                    "remoteActive": { "type": "integer" },
+                    "timestamp": { "type": "string", "format": "date-time" }
+                  },
+                  "required": ["fleet","localActive","remoteActive","timestamp"]
+                }
+              }
+            }
+          },
+          "500": { "description": "Error", "content": { "application/json": { } } }
+        }
+      }
+    },
+    "/scale": {
+      "post": {
+        "summary": "Scale fleet to desired total",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": { "desired": { "type": "integer", "minimum": 0 } },
+                "required": ["desired"]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Scale accepted", "content": { "text/plain": { } } },
+          "400": { "description": "Bad request", "content": { "text/plain": { } } },
+          "500": { "description": "Error", "content": { "text/plain": { } } }
+        }
+      }
+    },
+    "/rolling-restart": {
+      "post": {
+        "summary": "Serial rolling restart",
+        "responses": {
+          "200": { "description": "OK", "content": { "text/plain": { } } },
+          "500": { "description": "Error", "content": { "text/plain": { } } }
+        }
+      }
+    },
+    "/sync-state": {
+      "post": {
+        "summary": "Rebuild local state from OCI",
+        "responses": {
+          "200": { "description": "OK", "content": { "text/plain": { } } },
+          "500": { "description": "Error", "content": { "text/plain": { } } }
+        }
+      }
+    },
+    "/openapi.json": {
+      "get": {
+        "summary": "OpenAPI specification",
+        "responses": {
+          "200": { "description": "OpenAPI JSON", "content": { "application/json": { } } }
+        }
+      }
+    }
+  }
+}`
+}
+
+// uiPageHTML returns a minimal interactive UI for status and control.
+func uiPageHTML() string {
+	return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>fleetctl UI</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 20px; color: #111; }
+h1 { margin-top: 0; }
+section { margin-bottom: 24px; padding-bottom: 16px; border-bottom: 1px solid #eee; }
+button { padding: 6px 12px; margin-right: 8px; }
+input[type=number] { width: 120px; padding: 6px; }
+pre { background: #f7f7f7; padding: 12px; overflow: auto; }
+small.mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace; color: #666; }
+</style>
+</head>
+<body>
+<h1>fleetctl UI</h1>
+
+<section>
+  <h2>Status</h2>
+  <div>
+    <button onclick="refresh()">Refresh</button>
+    <span class="mono"><small id="ts"></small></span>
+  </div>
+  <pre id="status">loading...</pre>
+</section>
+
+<section>
+  <h2>Metrics</h2>
+  <pre id="metrics">loading...</pre>
+</section>
+
+<section>
+  <h2>Scale</h2>
+  <label for="desired">Desired total:</label>
+  <input id="desired" type="number" min="0" value="0">
+  <button onclick="scale()">Apply</button>
+</section>
+
+<section>
+  <h2>Controls</h2>
+  <button onclick="rollingRestart()">Rolling Restart</button>
+  <button onclick="syncState()">Sync State</button>
+  <a href="/openapi.json" target="_blank">OpenAPI JSON</a>
+</section>
+
+<script>
+async function refresh() {
+  try {
+    const s = await fetch('/status');
+    const t = await s.text();
+    document.getElementById('status').textContent = t;
+
+    const m = await fetch('/metrics');
+    const j = await m.json();
+    document.getElementById('metrics').textContent = JSON.stringify(j, null, 2);
+    document.getElementById('desired').value = j.localActive ?? 0;
+    document.getElementById('ts').textContent = new Date().toLocaleString();
+  } catch (e) {
+    document.getElementById('status').textContent = 'Error: ' + e;
+  }
+}
+
+async function scale() {
+  const d = parseInt(document.getElementById('desired').value, 10) || 0;
+  const res = await fetch('/scale', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ desired: d })
+  });
+  const txt = await res.text();
+  alert(txt);
+  refresh();
+}
+
+async function rollingRestart() {
+  const res = await fetch('/rolling-restart', { method: 'POST' });
+  alert(await res.text());
+  refresh();
+}
+
+async function syncState() {
+  const res = await fetch('/sync-state', { method: 'POST' });
+  alert(await res.text());
+  refresh();
+}
+
+refresh();
+</script>
+</body>
+</html>`
 }
