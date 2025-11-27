@@ -11,11 +11,13 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"fleetctl/internal/client"
 	"fleetctl/internal/config"
 	"fleetctl/internal/fleet"
+	"fleetctl/internal/metrics"
 	"fleetctl/internal/state"
 )
 
@@ -33,6 +35,48 @@ var (
 	flagHTTP           string
 	flagReconcileEvery time.Duration
 )
+
+// controlStatus tracks the background control loop state for diagnostics.
+type controlStatus struct {
+	mu               sync.RWMutex
+	Enabled          bool
+	Interval         string
+	LastTick         time.Time
+	LastConfigReload *time.Time
+	Desired          int
+	Actual           int
+	LastAction       string
+	LastError        string
+	LoopCount        int
+}
+
+func (c *controlStatus) set(update func(*controlStatus)) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	update(c)
+}
+
+func (c *controlStatus) snapshot() map[string]any {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	var lcr string
+	if c.LastConfigReload != nil {
+		lcr = c.LastConfigReload.Format(time.RFC3339)
+	}
+	return map[string]any{
+		"enabled":          c.Enabled,
+		"interval":         c.Interval,
+		"lastTick":         c.LastTick.Format(time.RFC3339),
+		"lastConfigReload": lcr,
+		"desired":          c.Desired,
+		"actual":           c.Actual,
+		"lastAction":       c.LastAction,
+		"lastError":        c.LastError,
+		"loopCount":        c.LoopCount,
+	}
+}
+
+var ctrlStatus controlStatus
 
 func init() {
 	flag.StringVar(&flagConfig, "config", "fleet.yaml", "Path to fleet configuration file")
@@ -226,6 +270,8 @@ func startHTTPServer(f *fleet.Fleet, st *state.Store, cfg *config.FleetConfig, a
 			"localActive":  localActive,
 			"remoteActive": remoteActive,
 			"timestamp":    time.Now().Format(time.RFC3339),
+			"control":      ctrlStatus.snapshot(),
+			"actions":      metrics.Snapshot(),
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(resp)
@@ -281,6 +327,85 @@ func startHTTPServer(f *fleet.Fleet, st *state.Store, cfg *config.FleetConfig, a
 		_, _ = w.Write([]byte("sync-state OK"))
 	})
 
+	// Emit control loop status
+	mux.HandleFunc("/control", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(ctrlStatus.snapshot())
+	})
+
+	// Server-Sent Events for live updates
+	mux.HandleFunc("/events", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		w.Header().Set("X-Accel-Buffering", "no")
+		fl, ok := w.(http.Flusher)
+		if !ok {
+			http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+			return
+		}
+		ctx := r.Context()
+		ticker := time.NewTicker(1 * time.Second)
+		defer ticker.Stop()
+
+		// initial ping to open the stream in some proxies/browsers
+		fmt.Fprintf(w, ": ping\n\n")
+		fl.Flush()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				// control snapshot first (authoritative desired from control loop that reloads config)
+				ctrl := ctrlStatus.snapshot()
+				desired := 0
+				if dv, ok := ctrl["desired"].(int); ok {
+					desired = dv
+				} else if df, ok := ctrl["desired"].(float64); ok {
+					desired = int(df)
+				}
+
+				// compute local/remote
+				localActive, _ := st.CountActive(cfg.Metadata.Name)
+				remoteActive := 0
+				if f.Client != nil {
+					if inst, err := f.Client.ListInstancesByFleet(ctx, cfg.Spec.CompartmentID, cfg.Metadata.Name); err == nil {
+						remoteActive = len(inst)
+					}
+				}
+
+				// status HTML (Desired vs Remote vs Local)
+				statusHTML := fmt.Sprintf(
+					"<div class='grid3'><div><div class='label'>Desired</div><div class='value'>%d</div></div><div><div class='label'>Remote</div><div class='value'>%d</div></div><div><div class='label'>Local</div><div class='value'>%d</div></div></div>",
+					desired, remoteActive, localActive,
+				)
+
+				// metrics HTML
+				act := metrics.Snapshot()
+				actJSON, _ := json.MarshalIndent(act, "", "  ")
+				metricsHTML := "<pre>" + string(actJSON) + "</pre>"
+
+				// control HTML
+				ctrlJSON, _ := json.MarshalIndent(ctrl, "", "  ")
+				controlHTML := "<pre>" + string(ctrlJSON) + "</pre>"
+
+				// send SSE events for htmx-sse swapping (prefix each line with data:)
+				writeEvent := func(name, data string) {
+					fmt.Fprintf(w, "event: %s\n", name)
+					for _, ln := range strings.Split(data, "\n") {
+						fmt.Fprintf(w, "data: %s\n", ln)
+					}
+					fmt.Fprint(w, "\n")
+				}
+				writeEvent("status", statusHTML)
+				writeEvent("metrics", metricsHTML)
+				writeEvent("control", controlHTML)
+				fl.Flush()
+			}
+		}
+	})
+
 	// Serve OpenAPI spec and basic UI
 	mux.HandleFunc("/openapi.json", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -305,19 +430,36 @@ func startControlLoop(f *fleet.Fleet, cfgPath string, every time.Duration) {
 
 		var lastMod time.Time
 
+		ctrlStatus.set(func(c *controlStatus) {
+			c.Enabled = true
+			c.Interval = every.String()
+			c.LastError = ""
+		})
+
 		for {
+			ctrlStatus.set(func(c *controlStatus) {
+				c.LastTick = time.Now()
+				c.LoopCount++
+			})
 			// 1) Reload config if modified
 			if fi, err := os.Stat(cfgPath); err == nil {
 				if fi.ModTime().After(lastMod) {
 					if newCfg, err := config.ParseFile(cfgPath); err == nil {
 						f.Config = *newCfg
 						lastMod = fi.ModTime()
+						t := fi.ModTime()
+						tCopy := t
+						ctrlStatus.set(func(c *controlStatus) {
+							c.LastConfigReload = &tCopy
+							c.LastError = ""
+						})
 						log.Printf("control: reloaded config (modified %s)", fi.ModTime().Format(time.RFC3339))
 					} else {
 						log.Printf("control: parse config error: %v", err)
 					}
 				}
 			} else {
+				ctrlStatus.set(func(c *controlStatus) { c.LastError = err.Error() })
 				log.Printf("control: stat config error: %v", err)
 			}
 
@@ -326,20 +468,29 @@ func startControlLoop(f *fleet.Fleet, cfgPath string, every time.Duration) {
 			for _, g := range f.Config.Spec.Instances {
 				desired += g.Count
 			}
+			ctrlStatus.set(func(c *controlStatus) { c.Desired = desired })
 
 			// 3) Compare actual vs desired and reconcile if needed
 			if f.Client != nil {
 				inst, err := f.Client.ListInstancesByFleet(context.Background(), f.Config.Spec.CompartmentID, f.Config.Metadata.Name)
 				if err != nil {
+					ctrlStatus.set(func(c *controlStatus) { c.LastError = err.Error() })
 					log.Printf("control: list instances error: %v", err)
 				} else {
 					actual := len(inst)
+					ctrlStatus.set(func(c *controlStatus) {
+						c.Actual = actual
+						c.LastError = ""
+					})
 					if actual != desired {
+						ctrlStatus.set(func(c *controlStatus) { c.LastAction = fmt.Sprintf("scale to %d", desired) })
 						log.Printf("control: reconciling desired=%d actual=%d", desired, actual)
 						if err := f.Scale(desired); err != nil {
+							ctrlStatus.set(func(c *controlStatus) { c.LastError = err.Error() })
 							log.Printf("control: scale to %d failed: %v", desired, err)
 						}
 					} else {
+						ctrlStatus.set(func(c *controlStatus) { c.LastAction = "noop" })
 						log.Printf("control: desired matches actual (%d); no action", actual)
 					}
 				}
@@ -391,7 +542,9 @@ func openAPISpecJSON() string {
                     "fleet": { "type": "string" },
                     "localActive": { "type": "integer" },
                     "remoteActive": { "type": "integer" },
-                    "timestamp": { "type": "string", "format": "date-time" }
+                    "timestamp": { "type": "string", "format": "date-time" },
+                    "control": { "type": "object" },
+                    "actions": { "type": "object" }
                   },
                   "required": ["fleet","localActive","remoteActive","timestamp"]
                 }
@@ -449,6 +602,14 @@ func openAPISpecJSON() string {
           "200": { "description": "OpenAPI JSON", "content": { "application/json": { } } }
         }
       }
+    },
+    "/control": {
+      "get": {
+        "summary": "Control loop status",
+        "responses": {
+          "200": { "description": "JSON status", "content": { "application/json": { } } }
+        }
+      }
     }
   }
 }`
@@ -462,64 +623,58 @@ func uiPageHTML() string {
 <meta charset="utf-8">
 <title>fleetctl UI</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="https://unpkg.com/htmx.org@1.9.12"></script>
+<script src="https://unpkg.com/htmx.org/dist/ext/sse.js"></script>
 <style>
-body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 20px; color: #111; }
-h1 { margin-top: 0; }
-section { margin-bottom: 24px; padding-bottom: 16px; border-bottom: 1px solid #eee; }
-button { padding: 6px 12px; margin-right: 8px; }
+:root { --border:#e5e7eb; --muted:#666; --bg:#fff; --chip:#f3f4f6;}
+body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 20px; color: #111; background: var(--bg); }
+h1 { margin: 0 0 12px 0; }
+h2 { margin: 0 0 8px 0; font-size: 1.1rem; }
+section { margin-bottom: 20px; padding: 12px; border: 1px solid var(--border); border-radius: 8px; }
+.grid3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+.label { font-size: 0.8rem; color: var(--muted); }
+.value { font-size: 1.6rem; font-weight: 600; }
+.controls { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 input[type=number] { width: 120px; padding: 6px; }
-pre { background: #f7f7f7; padding: 12px; overflow: auto; }
-small.mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace; color: #666; }
+button, .btn { padding: 6px 12px; border: 1px solid var(--border); background:#fff; border-radius:6px; cursor:pointer;}
+button:hover, .btn:hover { background: var(--chip); }
+pre { background: #f7f7f7; padding: 12px; overflow: auto; border-radius: 6px; }
+.kv { display: grid; grid-template-columns: 160px 1fr; gap: 6px; }
+.ts { font-size: 0.8rem; color: var(--muted); }
 </style>
 </head>
-<body>
+<body hx-ext="sse" sse-connect="/events">
 <h1>fleetctl UI</h1>
 
 <section>
-  <h2>Status</h2>
-  <div>
-    <button onclick="refresh()">Refresh</button>
-    <span class="mono"><small id="ts"></small></span>
-  </div>
-  <pre id="status">loading...</pre>
+  <h2>Fleet Status</h2>
+  <div id="status-panel" sse-swap="status"></div>
+  <div class="ts">Live via SSE</div>
 </section>
 
 <section>
-  <h2>Metrics</h2>
-  <pre id="metrics">loading...</pre>
+  <h2>Operation Metrics</h2>
+  <div id="metrics-panel" sse-swap="metrics"></div>
 </section>
 
 <section>
-  <h2>Scale</h2>
-  <label for="desired">Desired total:</label>
-  <input id="desired" type="number" min="0" value="0">
-  <button onclick="scale()">Apply</button>
+  <h2>Control Loop</h2>
+  <div id="control-panel" sse-swap="control"></div>
 </section>
 
 <section>
   <h2>Controls</h2>
-  <button onclick="rollingRestart()">Rolling Restart</button>
-  <button onclick="syncState()">Sync State</button>
-  <a href="/openapi.json" target="_blank">OpenAPI JSON</a>
+  <div class="controls">
+    <label for="desired">Desired total:</label>
+    <input id="desired" type="number" min="0" value="0">
+    <a class="btn" href="#" onclick="scale()">Scale</a>
+    <a class="btn" href="#" onclick="rollingRestart()">Rolling Restart</a>
+    <a class="btn" href="#" onclick="syncState()">Sync State</a>
+    <a class="btn" href="/openapi.json" target="_blank">OpenAPI JSON</a>
+  </div>
 </section>
 
 <script>
-async function refresh() {
-  try {
-    const s = await fetch('/status');
-    const t = await s.text();
-    document.getElementById('status').textContent = t;
-
-    const m = await fetch('/metrics');
-    const j = await m.json();
-    document.getElementById('metrics').textContent = JSON.stringify(j, null, 2);
-    document.getElementById('desired').value = j.localActive ?? 0;
-    document.getElementById('ts').textContent = new Date().toLocaleString();
-  } catch (e) {
-    document.getElementById('status').textContent = 'Error: ' + e;
-  }
-}
-
 async function scale() {
   const d = parseInt(document.getElementById('desired').value, 10) || 0;
   const res = await fetch('/scale', {
@@ -527,24 +682,16 @@ async function scale() {
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({ desired: d })
   });
-  const txt = await res.text();
-  alert(txt);
-  refresh();
+  alert(await res.text());
 }
-
 async function rollingRestart() {
   const res = await fetch('/rolling-restart', { method: 'POST' });
   alert(await res.text());
-  refresh();
 }
-
 async function syncState() {
   const res = await fetch('/sync-state', { method: 'POST' });
   alert(await res.text());
-  refresh();
 }
-
-refresh();
 </script>
 </body>
 </html>`

@@ -20,3 +20,5 @@ coverage.out
 # IDE/editor
 .vscode/
 .idea/
+.local-dev-fleet.state.json
+fleet.local.yaml

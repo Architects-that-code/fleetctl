@@ -3,239 +3,299 @@ Version: 0.1.0
 Status: Draft (living, continuously updated)
 
 Purpose
-- Define the intended functionality, behavior, and constraints of the fleetctl CLI.
+- Define the intended functionality, behavior, and constraints of the fleetctl CLI/daemon.
 - Serve as the source of truth for current capabilities and upcoming work.
-- Provide acceptance criteria for features and a shared vocabulary for contributors.
+- Provide acceptance criteria and a shared vocabulary for contributors.
 
 Scope
 - Manage a fleet of OCI compute instances via a YAML config (fleet.yaml).
 - Provide CLI commands to inspect state, scale, and perform rolling restarts.
-- Non-goals (for v0.x): multi-cloud support, GUI, secret management beyond standard OCI mechanisms.
+- Provide an HTTP daemon mode for metrics/observability and remote control.
+- Non-goals (for v0.x): multi-cloud support, rich GUI (beyond a basic HTML page), secret management beyond standard OCI mechanisms.
 
 Current Implementation Snapshot (as of v0.1.0)
-- CLI entrypoint: cmd/fleetctl/main.go
-  - Flags:
-    - --config string (default: fleet.yaml)
-    - --scale int (desired total instances)
-    - --rolling-restart (bool)
-    - --auth-validate (bool) validate auth and print details
-    - --status (bool) print tracked fleet state and exit
-    - --state string path to local state JSON (default ".fleetctl/state.json")
-    - --version (prints version)
-  - Default behavior: loads config and prints a human-friendly summary (when no action flags).
-- Config loader: internal/config
-  - config.ParseFile reads YAML into FleetConfig struct.
-  - Struct currently includes: kind, metadata.name, spec.{compartmentId, imageId, availabilityDomain, shape, subnetId, displayNamePrefix, definedTags, freeformTags, instances[]}
-- Client: internal/client
-  - New(auth) initializes an OCI ConfigurationProvider based on spec.auth:
-    - method: "user" uses OCI CLI config file/profile
-    - method: "instance" uses Instance Principal
-    - Region resolution: spec.auth.region -> OCI_REGION env -> provider.Region()
-    - User principal config path: spec.auth.configFile -> OCI_CLI_CONFIG_FILE env -> ~/.oci/config
-  - ValidateInfo(ctx) performs lightweight calls to validate auth and returns:
-    - resolved region
-    - tenancy OCID (if available)
-    - user OCID (if user principal)
-    - subscribed regions (if available)
-    - total regions available
-  - --auth-validate uses ValidateInfo and prints these details
-  - Client is lazily initialized only when an action flag requires OCI access.
-- Fleet logic: internal/fleet
-  - New(cfg, client) constructs Fleet.
-  - Summary() returns a string summary of the loaded config.
-  - Scale() launches/terminates OCI instances via Compute; RollingRestart() replaces instances one-by-one.
-- Build/Run
-  - make build produces ./bin/fleetctl
-  - make run ARGS="--config fleet.yaml" runs the CLI
-  - go run ./cmd/fleetctl also supported
+CLI entrypoint: cmd/fleetctl/main.go
+- Invocation rule: Requires --config plus at least one additional flag (usage shown otherwise).
+- Flags:
+  - --config string (default: fleet.yaml) Path to fleet configuration file
+  - --version Print version and exit
+  - --status Print tracked fleet state from local store and exit
+  - --state string Path to local state JSON (default ".fleetctl/state.json"; relocated next to config as .<fleet>.state.json unless overridden)
+  - --auth-validate Validate OCI authentication by performing a lightweight API call (prints details on success)
+  - --scale int Desired total instances (idempotent scale up/down)
+  - --rolling-restart Serial one-by-one replacement of active instances
+  - --sync-state Rebuild local state by discovering instances tagged to this fleet
+  - --http string Start HTTP server (daemon mode), e.g., ":8080" or "127.0.0.1:8080"
+  - --reconcile-every duration Background controller loop interval when --http is set (default 30s; e.g., 30s, 1m)
+
+Configuration loader: internal/config
+- config.ParseFile reads YAML into FleetConfig struct.
+- Struct fields (subset):
+  - kind, metadata.name
+  - spec fields:
+    - compartmentId (string)
+    - imageId (string)
+    - availabilityDomain (string) (Suffix or full name accepted; auto-resolved)
+    - shape (string)
+    - shapeConfig (object; required when Flex shapes used) { ocpus, memoryInGBs }
+    - subnetId (string)
+    - displayNamePrefix (string, optional)
+    - scaling (object) { parallelLaunch, parallelTerminate } (required by schema; ints >= 1)
+    - auth (object) { method: instance|user, configFile, profile, region }
+    - definedTags (map[string]string), freeformTags (map[string]string)
+    - instances (array): { name, count, subnetId? } (per-group overrides allowed)
+- Subnet selection precedence:
+  - instances[].subnetId (if set for the matched group), otherwise spec.subnetId
+
+OCI Client: internal/client
+- New(auth) initializes an OCI ConfigurationProvider based on spec.auth:
+  - method: "user" uses OCI CLI config file/profile (path expansion, OCI_CLI_CONFIG_FILE supported)
+  - method: "instance" uses Instance Principal
+  - Region resolution: spec.auth.region -> OCI_REGION env -> provider.Region()
+- Fleet tagging:
+  - All launched instances include freeform tag fleetctl-fleet=<fleetName> for discovery.
+- ValidateInfo(ctx) performs lightweight calls:
+  - returns region, tenancy OCID, user OCID (if any), subscribed regions, regions count.
+- Compute operations:
+  - LaunchInstances(ctx, cfg, group, n)
+    - AD auto-resolution; subnet/image preflight checks
+    - If Work Request ID present, poll via Work Request API; otherwise poll instance lifecycle to RUNNING
+    - Progress logs emitted during wait
+  - TerminateInstances(ctx, ids)
+    - Poll lifecycle to TERMINATED (NotAuthorizedOrNotFound treated as success during polling)
+    - Progress logs emitted during wait
+  - ListInstancesByFleet(ctx, compartmentId, fleetName)
+    - Discover non-terminated instances by fleet tag
+
+State store: internal/state
+- JSON ledger file (default moved next to config as .<fleet>.state.json)
+- API: AddActiveRecord, ActiveRecordsLIFO, MarkTerminatedByIDs, CountActive, Summary, ResetFleetActive (for SyncState)
+
+Fleet logic: internal/fleet
+- New(cfg, client, store) constructs Fleet
+- Summary(): basic summary string of loaded config
+- Scale(desiredTotal):
+  - Scale Up:
+    - Parallel launches with bounded concurrency: spec.scaling.parallelLaunch (default 5 if unset)
+    - After launches complete, Verify phase checks actual (remote) equals desired; then SyncState to reconcile local ledger
+  - Scale Down:
+    - Parallel terminations with bounded concurrency: spec.scaling.parallelTerminate (default 10 if unset)
+    - After terminations complete, Verify phase checks actual equals desired; then SyncState
+- RollingRestart():
+  - Strictly serial loop: terminate one -> wait -> mark terminated -> launch one -> wait -> record
+- verifyActualMatches(ctx, desired):
+  - Poll ListInstancesByFleet until actual equals desired or timeout
+- SyncState():
+  - Rebuild state store by listing instances via fleet tag and parsing groups from names
+
+HTTP Daemon Mode
+Start:
+  ./bin/fleetctl --config fleet.yaml --http :8080 [--reconcile-every 30s]
+Endpoints:
+- GET /healthz
+  - Liveness probe; returns "ok"
+- GET /status
+  - Prints text status (Local vs Remote counts, drift info, local summary)
+- GET /metrics
+  - JSON metrics; includes:
+    - fleet: string
+    - localActive: int
+    - remoteActive: int
+    - timestamp: RFC3339
+    - control: object (control loop status; see below)
+    - actions: object (operation metrics; see below)
+- GET /control
+  - JSON status of the background control loop; fields:
+    - enabled: bool
+    - interval: string (e.g., "30s")
+    - lastTick: RFC3339 last loop tick time
+    - lastConfigReload: RFC3339 last config reload time (if any)
+    - desired: computed total from spec.instances[].count
+    - actual: live count discovered via tag
+    - lastAction: "scale to N" or "noop"
+    - lastError: last loop error message, if any
+    - loopCount: total iterations since start
+- POST /scale
+  - Body: { "desired": <int>=0+ }
+  - Performs scale up/down with verification and SyncState
+- POST /rolling-restart
+  - Performs serial rolling restart
+- POST /sync-state
+  - Rebuild state store from discovery
+- GET /openapi.json
+  - OpenAPI 3.0 JSON for all endpoints
+- GET /
+  - Basic HTML page providing:
+    - Status text
+    - Metrics JSON
+    - Control loop JSON
+    - Scale/rolling-restart/sync-state controls
+    - Link to OpenAPI JSON
+
+Control Loops (Documented)
+- Master Reconciliation Loop (daemon mode)
+  - Trigger: runs every --reconcile-every (default 30s)
+  - Steps:
+    1) Reload config if mtime changed
+    2) Compute desired total as sum(instances[].count)
+    3) Discover actual total via tag
+    4) If actual != desired:
+       - Call Scale(desiredTotal)
+       - Scale will perform parallel launches/terminations as needed, then verify + SyncState
+    5) Record telemetry to /control and /metrics.control
+- Scale Up Loop
+  - Structure: parallel launch workers bounded by spec.scaling.parallelLaunch
+  - Phases: planning -> launch -> verify -> done
+  - Verification: poll actual until desired reached; then SyncState
+  - Error handling: per-item capture; emits metrics.actions.launchFailed on error
+- Scale Down Loop
+  - Structure: parallel terminations bounded by spec.scaling.parallelTerminate
+  - Phases: planning -> terminate -> verify -> done
+  - Verification: poll actual until desired reached; then SyncState
+- Rolling Restart Loop
+  - Structure: strictly serial over the active list (LIFO selection)
+  - Phases per-item: terminate -> launch
+  - Guarantees: avoids outages by never replacing more than one at a time
+
+Metrics and Observability
+- Operation Metrics (internal/metrics; emitted via /metrics.actions)
+  - Global snapshot fields:
+    - operation: "scale-up" | "scale-down" | "rolling-restart" | "sync-state" | "verify"
+    - phase: "planning" | "launch" | "terminate" | "verify" | "done"
+    - startedAt: RFC3339
+    - lastUpdate: RFC3339
+    - launchRequested, launchSucceeded, launchFailed (ints)
+    - terminateRequested, terminateSucceeded, terminateFailed (ints)
+    - rollingRestartIndex, rollingRestartTotal (per-item progress)
+    - lastError: last operation error string, if any
+  - Emission points:
+    - Scale Up:
+      - Reset("scale-up"); phase "launch"; IncLaunchRequested(missing)
+      - On each success: IncLaunchSucceeded()
+      - On each failure: IncLaunchFailed(err)
+      - After launch: phase "verify"; verifyActualMatches; then SyncState; Done()
+    - Scale Down:
+      - Reset("scale-down"); phase "terminate"; IncTerminateRequested(len(ids))
+      - On each success: IncTerminateSucceeded()
+      - On each failure: IncTerminateFailed(err)
+      - After terminate: phase "verify"; verifyActualMatches; then SyncState; Done()
+    - Rolling Restart:
+      - Reset("rolling-restart"); SetRollingRestart(0, total)
+      - For each item: SetRollingRestart(i+1, total), phase "terminate" -> "launch"; per-step counters; Done() at the end
+- Control Loop Metrics (exposed via /control and included in /metrics.control)
+  - See fields in HTTP Daemon Mode above
+
+Acceptance Criteria (Observability)
+- During scale-up/scale-down/rolling-restart:
+  - /metrics.actions reflects current operation, phase, counts, and lastError when present
+  - /status shows progress logs in CLI output; /metrics and /control reflect updates within 1s of changes
+- In daemon mode:
+  - /control returns enabled=true, correct interval, consistently advancing lastTick and loopCount
+  - When config is modified, lastConfigReload updates and loop reacts accordingly
+- After operations complete:
+  - /metrics.actions.phase == "done"
+  - Scale: actual (discovered) equals desired and state is reconciled (SyncState)
+  - Rolling restart: all items processed and counts consistent
 
 CLI Specification
-Invocation rule: Requires --config plus at least one additional flag; otherwise usage is printed and the program exits with code 1.
-- Global flags
-  - --config string
-    - Default: fleet.yaml
-    - Purpose: path to YAML config describing the fleet
-    - Errors:
-      - File not found: exit non-zero; log fatal
-      - YAML invalid: exit non-zero; log fatal
-  - --version
-    - Prints CLI version and exits 0
-  - --status
-    - Prints tracked fleet state from local store and exits 0
-  - --state string
-    - Path to local state JSON file (default ".fleetctl/state.json")
-  - --auth-validate
-    - Validate OCI authentication by performing a lightweight IAM call; exits 0 on success, non-zero on failure
-- Commands (v0.1.x modeled as flags; may evolve into subcommands later)
-  - --scale N
-    - Desired behavior:
-      - Set total number of instances across the fleet to N (idempotent)
-      - If current total < N, create missing instances according to instance groups
-      - If current total > N, terminate excess instances (policy: reverse-creation order or lexicographic, TBD)
-    - Pre-conditions:
-      - Config valid; OCI credentials available
-    - Post-conditions:
-      - Total instances equal N
-    - Errors:
-      - Provisioning/termination errors should produce non-zero exit; partial progress may exist
-  - --rolling-restart
-    - Desired behavior:
-      - Restart instances one-by-one (or batched with window size), waiting for readiness between steps
-    - Pre-conditions:
-      - Config valid; OCI credentials available; ability to determine instance readiness
-    - Post-conditions:
-      - All targeted instances replaced/restarted
-    - Errors:
-      - Non-zero exit if any step fails; should avoid thundering herd (respect backoff or delays)
-
-Exit Codes
-- 0: success
-- 1: invalid arguments or configuration
-- 2: infrastructure operation error (create/terminate/list etc.)
-- 3: unexpected internal error
+- Exit codes:
+  - 0: success
+  - 1: invalid arguments or configuration
+  - 2: infrastructure operation error (create/terminate/list etc.)
+  - 3: unexpected internal error
 
 Configuration Specification (fleet.yaml)
-- kind (string)
-  - Example: FleetConfig
-  - Validation: must equal FleetConfig (TBD strictness)
+- kind (string): "FleetConfig"
 - metadata
-  - name (string) — identifier for the fleet
+  - name (string)
 - spec
-  - compartmentId (string) — OCI compartment OCID
-  - imageId (string) — OCI image OCID
-  - availabilityDomain (string) — e.g., PHX-AD-1
-  - shape (string) — compute shape (e.g., VM.Standard.E2.1.Micro)
-  - subnetId (string) — OCID of subnet for the primary VNIC
-  - displayNamePrefix (string, optional) — prefix for instance display names
+  - compartmentId (string)
+  - imageId (string)
+  - availabilityDomain (string)
+  - shape (string)
+  - shapeConfig (when Flex shapes)
+  - subnetId (string)
+  - displayNamePrefix (string, optional)
+  - scaling (object; REQUIRED by schema)
+    - parallelLaunch (int >= 1)
+    - parallelTerminate (int >= 1)
   - auth (object)
     - method: "instance" (default) or "user"
-    - configFile (user only): path to OCI config, default ~/.oci/config
-    - profile (user only): profile name, default "DEFAULT"
-    - region (optional): region override; else uses OCI_REGION env or provider region
-  - definedTags (map[string]string) — optional
-  - freeformTags (map[string]string) — optional
-  - instances (array of InstanceSpec)
-    - name (string) — logical name/group identifier
-    - count (int) — baseline count for the group
-    - subnetId (string, optional) — per-group subnet override
-Subnet selection precedence
-- instances[].subnetId (if set for the matched group)
-- spec.subnetId
-
-Notes:
-- Additional fields will be added as needed (shape, subnet, VCN, metadata, boot volume size, etc.).
-- Unknown fields should be preserved in doc/spec and added to struct as we implement.
+    - configFile (user only), profile (user only), region (optional)
+  - definedTags (map[string]string)
+  - freeformTags (map[string]string)
+  - instances (array)
+    - name (string)
+    - count (int)
+    - subnetId (string, optional)
 
 Authentication
 - Methods:
-  - instance: Instance Principal (default) via OCI metadata auth
-  - user: User Principal via OCI CLI config file and profile
-- Config (spec.auth):
-  - method: "instance" or "user"
-  - configFile (user only): path to config file (default ~/.oci/config)
-  - profile (user only): profile name (default "DEFAULT")
-  - region (optional): overrides region; else uses OCI_REGION env or provider region
+  - instance: Instance Principal (default)
+  - user: OCI CLI config file/profile
 - Region resolution:
   1) spec.auth.region
   2) OCI_REGION environment variable
-  3) provider.Region() from auth provider
+  3) provider.Region()
 - Config file resolution (user principal):
   1) spec.auth.configFile
-  2) OCI_CLI_CONFIG_FILE environment variable
+  2) OCI_CLI_CONFIG_FILE
   3) ~/.oci/config
 
 Examples
 - Print summary
-  - make run ARGS="--config fleet.yaml"
-  - Output: Fleet(kind=FleetConfig, name=dev-fleet, instances=1)
-- Scale to 3 (performs real OCI operations)
-  - make run ARGS="--config fleet.yaml --scale 3"
-- Rolling restart (performs real OCI operations)
-  - make run ARGS="--config fleet.yaml --rolling-restart"
+  - ./bin/fleetctl --config fleet.yaml
+- Scale to 3 (real OCI operations; shows progress)
+  - ./bin/fleetctl --config fleet.yaml --scale 3
+- Rolling restart (serial)
+  - ./bin/fleetctl --config fleet.yaml --rolling-restart
 - Auth validate (prints details)
-  - make run ARGS="--config fleet.yaml --auth-validate"
-  - For local development (user principal):
-    make run ARGS="--config fleet.local.yaml --auth-validate"
-  - Output (example):
-    Auth validation succeeded
-      region: us-phoenix-1
-      tenancy: ocid1.tenancy.oc1...
-      user: ocid1.user.oc1... or (instance principal)
-      regions_available: 34
-      subscriptions: us-phoenix-1,us-ashburn-1
+  - ./bin/fleetctl --config fleet.local.yaml --auth-validate
+- HTTP daemon (metrics + control)
+  - ./bin/fleetctl --config fleet.local.yaml --http :8080 --reconcile-every 30s
+  - curl -s localhost:8080/metrics | jq
+  - curl -s localhost:8080/control | jq
+  - open http://localhost:8080/
 
-Behavioral Requirements (to implement)
-- List/Status (optional milestone)
-  - List current instances (ID, name, lifecycle state, tags) filtered by fleet identifier/tags
-  - Acceptance:
-    - Returns 0 on success; shows accurate, current state
-- Scale
-  - Idempotent: running twice with same N makes no changes the second time
-  - Safe deletion policy for downscaling (deterministic; documented)
-  - Respect OCI rate limits and backoff
-  - Acceptance:
-    - After success, total instances equals N; no orphaned instances
-- Rolling Restart
-  - Replace instances one-by-one (or in batches), waiting for readiness
-  - Configurable batch size and delay
-  - Acceptance:
-    - No more than batch size replaced concurrently
-    - Respect failure thresholds; halt on repeated failures with clear error
-- Config Validation
-  - Validate required fields before starting operations; fail fast with concise messages
-- Observability
-  - Structured logs (level, field context); progress updates for long ops
+Behavioral Requirements (to implement/harden)
+- Idempotent Scale:
+  - Running twice with same N makes no changes the second time
+- Safe deletion policy for downscaling (deterministic: LIFO based on state)
+- Respect OCI rate limits and backoff
+- Rolling Restart:
+  - Strictly serial; configurable batch size/window in future
+- Config Validation:
+  - Validate required fields (shapeConfig for Flex, scaling block) before operations
+- Observability:
+  - Structured logs and metrics (see ActionsMetrics and control status)
 
 State Tracking
-- Purpose: Maintain a local ledger of instances created/terminated by fleetctl; not an authoritative OCI source of truth.
-- Storage: JSON file at ".fleetctl/state.json" (override via --state).
-- Scope: Only tracks resources managed via this CLI on the local machine; does not discover pre-existing instances.
-- API (internal/state): AddActiveInstances, RemoveActiveInstances, CountActive, Summary, AddActiveRecord, ActiveRecordsLIFO, MarkTerminatedByIDs.
-- Behavior:
-  - scale N updates tracked state to match N
-  - --status prints a human-readable summary grouped by instance group
-  - Future milestones will reconcile tracked state with OCI and detect drift
+- Purpose: Maintain a local ledger of instances created/terminated by fleetctl
+- Storage: JSON file adjacent to config (.fleetName.state.json) unless overridden via --state
+- Sync / Discovery:
+  - SyncState rebuilds ledger from OCI by tag
 - Operational notes:
-  - Do not commit .fleetctl/ to source control; add it to .gitignore
-  - Deleting the state file forgets history; use cautiously
+  - Recommend not committing local state files; add to .gitignore
 
 Non-Functional Requirements
-- Reliability: retries with backoff for OCI calls; idempotent operations
-- Performance: reasonable parallelization within rate limits
-- Security: use OCI-standard auth; avoid logging secrets
+- Reliability: backoff and retries where appropriate; idempotent operations
+- Performance: bounded concurrency; parallelism tuned by config
+- Security: OCI-standard auth; avoid logging secrets
 - UX: clear error messages with remediation hints
-- Testing: unit tests for config parsing and fleet decisions; integration tests behind a feature flag or separate profile
-
-Roadmap & Milestones
-- M0 (done): Bootstrapped CLI, config parsing, stubs, build tooling
-- M1: Status/List command; align config struct with sample fields (availabilityDomain)
-- M2: Implement Scale with idempotency; deterministic downscale policy
-- M3: Implement Rolling Restart with batch/window size and readiness checks
-- M4: Config validation, richer Spec (shape, subnet, etc.), and tagging strategy
-- M5: Tests, docs hardening, examples, error taxonomy and exit codes enforced
-
-Open Questions
-- Downscale policy: which instances to terminate first? (age, name sort, explicit policy)
-- Readiness signal: how to determine instance readiness? (lifecycle state, custom health check, cloud-init logs)
-- Instance grouping: allocate scaling across groups or treat total as global with weights?
-- Tagging strategy: which tags uniquely identify fleet membership across regions/compartments?
-
-Risks and Assumptions
-- OCI rate limiting can throttle operations; must implement backoff and chunking
-- Partial failure scenarios must be handled and reported clearly
-- Config drift vs. actual state requires reconciliation logic
+- Testing: unit tests for config parsing and decisions; integration tests where possible
 
 Change Log
-- 2025-11-22 v0.1.0 (draft)
-  - Initial spec created. Mirrors current CLI flags and stubs. Added roadmap and acceptance criteria outlines.
-- 2025-11-23
-  - Enhanced --auth-validate to return and print details (region, tenancy, user, region subscriptions).
-  - Updated README and Current Implementation Snapshot with --status, --state, --auth-validate.
+- 2025-11-27
+  - Added HTTP daemon with /healthz, /status, /metrics, /control, /scale, /rolling-restart, /sync-state, and /openapi.json
+  - Implemented master reconciliation loop (--reconcile-every) with config reload and drift correction
+  - Added fleet tagging, SyncState, and default state file co-located with config
+  - Added configurable bounded concurrency (spec.scaling.parallelLaunch/parallelTerminate)
+  - Added operation metrics (/metrics.actions) and control loop status (/control)
 - 2025-11-26
-  - Implemented real Scale (OCI launch/terminate) and RollingRestart (one-by-one replacement).
-  - Added new config fields: spec.shape, spec.subnetId, spec.displayNamePrefix; updated schema and templates.
-  - Extended state store (AddActiveRecord, ActiveRecordsLIFO, MarkTerminatedByIDs) and client (Compute methods).
-
-Maintenance Policy
-- Update this document with any user-visible behavior changes (flags, commands, config schema) as part of each PR.
-- Keep Roadmap and Change Log current to reflect planned and completed work.
+  - Implemented real Scale and RollingRestart
+  - Added spec fields: shape, subnetId, displayNamePrefix; schema and templates updated
+  - Extended state store and client
+- 2025-11-23
+  - Enhanced --auth-validate to return and print details
+- 2025-11-22 v0.1.0 (draft)
+  - Initial spec created; roadmap and acceptance criteria outlines

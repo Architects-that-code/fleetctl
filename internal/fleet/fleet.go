@@ -11,6 +11,7 @@ import (
 
 	"fleetctl/internal/client"
 	"fleetctl/internal/config"
+	"fleetctl/internal/metrics"
 	"fleetctl/internal/state"
 )
 
@@ -62,6 +63,10 @@ func (f *Fleet) Scale(desiredTotal int) error {
 		// Scale up: launch missing instances in OCI (parallel with bounded concurrency)
 		missing := desiredTotal - current
 
+		metrics.Reset("scale-up")
+		metrics.SetPhase("launch")
+		metrics.IncLaunchRequested(missing)
+
 		type launchRes struct {
 			inst client.InstanceInfo
 			err  error
@@ -100,15 +105,26 @@ func (f *Fleet) Scale(desiredTotal int) error {
 		count := 0
 		for r := range resCh {
 			if r.err != nil {
+				metrics.IncLaunchFailed(r.err.Error())
 				return fmt.Errorf("launch OCI instances: %w", r.err)
 			}
 			if err := f.Store.AddActiveRecord(fleetName, group, r.inst.ID, r.inst.DisplayName); err != nil {
 				return fmt.Errorf("record instance %s: %w", r.inst.ID, err)
 			}
+			metrics.IncLaunchSucceeded()
 			count++
 		}
 
 		log.Printf("Scale: launched %d instances to reach %d", count, desiredTotal)
+		metrics.SetPhase("verify")
+		if err := f.verifyActualMatches(ctx, desiredTotal); err != nil {
+			metrics.SetError(err.Error())
+			return err
+		}
+		if err := f.SyncState(); err != nil {
+			return fmt.Errorf("sync state after scale up: %w", err)
+		}
+		metrics.Done()
 		return nil
 	}
 
@@ -123,6 +139,10 @@ func (f *Fleet) Scale(desiredTotal int) error {
 		ids = append(ids, r.ID)
 	}
 	// Terminate instances in parallel with bounded concurrency, then mark terminated
+	metrics.Reset("scale-down")
+	metrics.SetPhase("terminate")
+	metrics.IncTerminateRequested(len(ids))
+
 	var twg sync.WaitGroup
 	terrCh := make(chan error, len(ids))
 	// bounded concurrency from config (fallback to default 10)
@@ -140,9 +160,11 @@ func (f *Fleet) Scale(desiredTotal int) error {
 			tsem <- struct{}{}
 			defer func() { <-tsem }()
 			if err := f.Client.TerminateInstances(ctx, []string{id}); err != nil {
+				metrics.IncTerminateFailed(err.Error())
 				terrCh <- fmt.Errorf("terminate %s: %w", id, err)
 				return
 			}
+			metrics.IncTerminateSucceeded()
 		}()
 	}
 
@@ -158,6 +180,15 @@ func (f *Fleet) Scale(desiredTotal int) error {
 		return fmt.Errorf("update state: %w", err)
 	}
 	log.Printf("Scale: terminated %d instances to reach %d", len(ids), desiredTotal)
+	metrics.SetPhase("verify")
+	if err := f.verifyActualMatches(ctx, desiredTotal); err != nil {
+		metrics.SetError(err.Error())
+		return err
+	}
+	if err := f.SyncState(); err != nil {
+		return fmt.Errorf("sync state after scale down: %w", err)
+	}
+	metrics.Done()
 	return nil
 }
 
@@ -291,30 +322,42 @@ func (f *Fleet) RollingRestart() error {
 		return fmt.Errorf("list instances to restart: %w", err)
 	}
 
+	metrics.Reset("rolling-restart")
+	metrics.SetRollingRestart(0, current)
+
 	for i := range recs {
 		r := recs[i]
+		metrics.SetRollingRestart(i+1, current)
+
 		// 1) Terminate this instance
+		metrics.SetPhase("terminate")
 		if err := f.Client.TerminateInstances(ctx, []string{r.ID}); err != nil {
+			metrics.IncTerminateFailed(err.Error())
 			return fmt.Errorf("terminate instance %s: %w", r.ID, err)
 		}
+		metrics.IncTerminateSucceeded()
 		if err := f.Store.MarkTerminatedByIDs(fleetName, []string{r.ID}); err != nil {
 			return fmt.Errorf("update state for %s: %w", r.ID, err)
 		}
 		log.Printf("RollingRestart: terminated %s (%s)", r.ID, r.Name)
 
 		// 2) Launch a replacement in the same group
+		metrics.SetPhase("launch")
 		created, err := f.Client.LaunchInstances(ctx, f.Config, r.Group, 1)
 		if err != nil {
+			metrics.IncLaunchFailed(err.Error())
 			return fmt.Errorf("launch replacement for %s: %w", r.ID, err)
 		}
 		for _, inst := range created {
 			if err := f.Store.AddActiveRecord(fleetName, r.Group, inst.ID, inst.DisplayName); err != nil {
 				return fmt.Errorf("record replacement %s: %w", inst.ID, err)
 			}
+			metrics.IncLaunchSucceeded()
 			log.Printf("RollingRestart: launched replacement %s (%s)", inst.ID, inst.DisplayName)
 		}
 	}
 
+	metrics.Done()
 	return nil
 }
 
