@@ -407,7 +407,7 @@ func startHTTPServer(f *fleet.Fleet, st *state.Store, cfg *config.FleetConfig, a
 						groupParts = append(groupParts, fmt.Sprintf("%s:%d", name, g.Count))
 					}
 				}
-				minimumsHTML := fmt.Sprintf("<div class='minimums'><div class='label'>Minimums</div><div class='value'>%d</div><div class='groups'>%s</div></div>", minTotal, html.EscapeString(strings.Join(groupParts, " ")))
+				minimumsHTML := fmt.Sprintf("<div class='minimums'><div class='label'>Config file Minimums</div><div class='value'>%d</div><div class='groups'>%s</div></div>", minTotal, html.EscapeString(strings.Join(groupParts, " ")))
 
 				// metrics HTML
 				act := metrics.Snapshot()
@@ -468,6 +468,14 @@ func startHTTPServer(f *fleet.Fleet, st *state.Store, cfg *config.FleetConfig, a
 					}
 				}
 
+				// Drift badge HTML comparing desired vs remote actual
+				driftBadgeHTML := ""
+				if remoteActive == desired {
+					driftBadgeHTML = "<div class='badge drift drift-ok'>No drift</div>"
+				} else {
+					driftBadgeHTML = "<div class='badge drift drift-alert'>Drift detected</div>"
+				}
+
 				// control HTML
 				ctrlJSON, _ := json.MarshalIndent(ctrl, "", "  ")
 				controlHTML := "<pre>" + string(ctrlJSON) + "</pre>"
@@ -480,7 +488,7 @@ func startHTTPServer(f *fleet.Fleet, st *state.Store, cfg *config.FleetConfig, a
 					}
 					fmt.Fprint(w, "\n")
 				}
-				writeEvent("status", statusHTML+minimumsHTML+lbBadgeHTML+scaleBadgeHTML+rrBadgeHTML)
+				writeEvent("status", lbBadgeHTML+scaleBadgeHTML+rrBadgeHTML+driftBadgeHTML+minimumsHTML+statusHTML)
 				writeEvent("metrics", metricsHTML)
 				writeEvent("control", controlHTML)
 				fl.Flush()
@@ -748,6 +756,8 @@ pre { background: #f7f7f7; padding: 12px; overflow: auto; border-radius: 6px; }
 .badge.scale.scale-down { background:#fef3c7; color:#92400e; border-color:#fcd34d; }
 .badge.scale.scale-idle { background:#f3f4f6; color:#374151; border-color:#e5e7eb; }
 .badge.rr.rr-in-progress { background:#dbeafe; color:#1e40af; border-color:#bfdbfe; }
+.badge.drift.drift-ok { background:#e6ffed; color:#065f46; border-color:#a7f3d0; }
+.badge.drift.drift-alert { background:#fee2e2; color:#991b1b; border-color:#fecaca; }
 .minimums { margin-top:8px; padding:8px; background: var(--chip); border:1px solid var(--border); border-radius:6px; }
 .minimums .groups { font-size:0.8rem; color: var(--muted); margin-top:4px; }
 </style>

@@ -1,22 +1,67 @@
 # yaml-language-server: $schema=./schema/fleetctl.schema.json
+# FleetCTL local development configuration template
+# Use this when running on a workstation where Instance Principal auth is not available.
+
 kind: FleetConfig
 metadata:
-  name: dev-fleet
+  # Human-friendly name for this local fleet
+  name: local-dev-fleet
 spec:
-  compartmentId: ocid1.compartments.oc1..example..aaaaaaa
-  imageId: ocid1.image.oc1..example..bbbbbbbbb
-  availabilityDomain: PHX-AD-1
+  # REQUIRED: OCI Compartment OCID where instances would be managed
+  compartmentId: "ocid1.compartment.oc1.."
+
+  # REQUIRED: OCI Image OCID to use when creating instances
+  imageId: "ocid1.image.oc1.iad."
+
+  # OPTIONAL: Availability Domain (e.g., PHX-AD-1)
+  # Leave empty to auto-resolve an AD in the configured region
+  availabilityDomain: ""
+  # REQUIRED: Compute shape (use non-Flex unless you also set shapeConfig support)
+  shape: "VM.Standard.E5.Flex"
+  shapeConfig:
+    ocpus: 2
+    memoryInGBs: 16
+  # REQUIRED: Subnet OCID for the primary VNIC (default for groups unless overridden)
+  subnetId: "ocid1.subnet.oc1.iad."
+  scaling:
+    parallelLaunch: 10
+    parallelTerminate: 10
+  loadBalancer:
+    enabled: true
+    subnetId: "ocid1.subnet.oc1.iad."
+    isPrivate: true
+    listenerPort: 80
+    backendPort: 80
+    minBandwidthMbps: 10
+    maxBandwidthMbps: 10
+    healthPath: "/"
+    policy: "ROUND_ROBIN"
+
+  # Authentication for OCI SDK (local workstation uses user principal)
   auth:
-    # method: "instance" uses Instance Principal auth (default)
-    # method: "user" uses the OCI CLI config file and profile below
-    method: instance
-    # configFile and profile are only used when method: user
+    # Local development: use the OCI CLI config file + profile
+    method: user
+    # Path to your OCI CLI config
     configFile: "~/.oci/config"
+    # Profile to use within the OCI CLI config
     profile: "DEFAULT"
-    # optional region override; if unset uses OCI_REGION env or provider region
-    region: ""
-  definedTags: {}
-  freeformTags: {}
+    # Optional region override. If unset, uses OCI_REGION env or provider region.
+    # Set this explicitly for deterministic behavior on a workstation:
+    region: "us-ashburn-1"
+
+  # OPTIONAL: Defined tags (namespace-scoped)
+  definedTags:
+    # "namespace.key": "value"
+
+  # OPTIONAL: Freeform tags 
+  freeformTags:
+    # "key": "value"
+    "automated-by": "fleetctl"
+
+  # REQUIRED: One or more instance groups
+  # For local testing of commands (e.g., --auth-validate, --status), keep counts at 0
+  # to avoid provisioning actions until scale logic is implemented against OCI.
   instances:
-  - name: web-server
-    count: 0  # Start with 0 instances to test creation logic
+    - name: web
+      count: 2
+      subnetId: "ocid1.subnet.oc1.iad."

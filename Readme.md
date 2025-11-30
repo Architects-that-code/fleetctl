@@ -1,3 +1,13 @@
+# Why this why now?
+ - had a customer that was not happy with existing tooling for our Instance Pools - wanted something that could do a rolling restart -   this ran around in my head thinking about how I would implement and what features I would want so I just started building (and then added some vibe coding in)
+  - thoughts:
+    - need a way to define fleet of instances
+    - need a way to track state (local or live?)
+    - need a way to do operations (scale, rolling restart)
+    - need a way to see status (CLI, HTTP UI?)
+    - need a way to authenticate (instance principal, user principal)
+    - needs to be testable and extensible
+
 # FleetCTL
 
 A CLI to manage a fleet of OCI compute instances from a simple YAML configuration.
