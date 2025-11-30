@@ -394,6 +394,8 @@ func startHTTPServer(f *fleet.Fleet, st *state.Store, cfg *config.FleetConfig, a
 					"<div class='grid3'><div><div class='label'>Desired</div><div class='value'>%d</div></div><div><div class='label'>Remote</div><div class='value'>%d</div></div><div><div class='label'>Local</div><div class='value'>%d</div></div></div>",
 					desired, remoteActive, localActive,
 				)
+				// fleet name header
+				fleetNameHTML := fmt.Sprintf("<div class='fleet-name'>Fleet: <code>%s</code></div>", html.EscapeString(cfg.Metadata.Name))
 				// minimums from config (sum and per-group)
 				minTotal := 0
 				var groupParts []string
@@ -436,12 +438,63 @@ func startHTTPServer(f *fleet.Fleet, st *state.Store, cfg *config.FleetConfig, a
 				if v, ok := act["operation"].(string); ok {
 					op = v
 				}
+				phase := ""
+				if v, ok := act["phase"].(string); ok {
+					phase = v
+				}
+				statusSuffix := ""
+				if phase != "" && strings.ToLower(phase) != "done" {
+					statusSuffix = " - " + html.EscapeString(phase)
+				}
+				// extract scale context and progress
+				startTotal := 0
+				if v, ok := act["startTotal"].(int); ok {
+					startTotal = v
+				} else if df, ok := act["startTotal"].(float64); ok {
+					startTotal = int(df)
+				}
+				targetTotal := 0
+				if v, ok := act["targetTotal"].(int); ok {
+					targetTotal = v
+				} else if df, ok := act["targetTotal"].(float64); ok {
+					targetTotal = int(df)
+				}
+				launchSucceeded := 0
+				if v, ok := act["launchSucceeded"].(int); ok {
+					launchSucceeded = v
+				} else if df, ok := act["launchSucceeded"].(float64); ok {
+					launchSucceeded = int(df)
+				}
+				terminateSucceeded := 0
+				if v, ok := act["terminateSucceeded"].(int); ok {
+					terminateSucceeded = v
+				} else if df, ok := act["terminateSucceeded"].(float64); ok {
+					terminateSucceeded = int(df)
+				}
+				delta := 0
+				if targetTotal >= startTotal {
+					delta = targetTotal - startTotal
+				} else {
+					delta = startTotal - targetTotal
+				}
 				scaleBadgeHTML := ""
 				switch strings.ToLower(op) {
 				case "scale-up":
-					scaleBadgeHTML = "<div class='badge scale scale-up'>Scaling up</div>"
+					x := launchSucceeded
+					y := delta
+					if y > 0 {
+						scaleBadgeHTML = fmt.Sprintf("<div class='badge scale scale-up'>Scaling up to %d (%d of %d)%s</div>", targetTotal, x, y, statusSuffix)
+					} else {
+						scaleBadgeHTML = fmt.Sprintf("<div class='badge scale scale-up'>Scaling up to %d%s</div>", targetTotal, statusSuffix)
+					}
 				case "scale-down":
-					scaleBadgeHTML = "<div class='badge scale scale-down'>Scaling down</div>"
+					x := terminateSucceeded
+					y := delta
+					if y > 0 {
+						scaleBadgeHTML = fmt.Sprintf("<div class='badge scale scale-down'>Scaling down to %d (%d of %d)%s</div>", targetTotal, x, y, statusSuffix)
+					} else {
+						scaleBadgeHTML = fmt.Sprintf("<div class='badge scale scale-down'>Scaling down to %d%s</div>", targetTotal, statusSuffix)
+					}
 				default:
 					scaleBadgeHTML = "<div class='badge scale scale-idle'>Scaling idle</div>"
 				}
@@ -488,7 +541,7 @@ func startHTTPServer(f *fleet.Fleet, st *state.Store, cfg *config.FleetConfig, a
 					}
 					fmt.Fprint(w, "\n")
 				}
-				writeEvent("status", lbBadgeHTML+scaleBadgeHTML+rrBadgeHTML+driftBadgeHTML+minimumsHTML+statusHTML)
+				writeEvent("status", fleetNameHTML+lbBadgeHTML+scaleBadgeHTML+rrBadgeHTML+driftBadgeHTML+minimumsHTML+statusHTML)
 				writeEvent("metrics", metricsHTML)
 				writeEvent("control", controlHTML)
 				fl.Flush()
@@ -749,6 +802,7 @@ button:hover, .btn:hover { background: var(--chip); }
 pre { background: #f7f7f7; padding: 12px; overflow: auto; border-radius: 6px; }
 .kv { display: grid; grid-template-columns: 160px 1fr; gap: 6px; }
 .ts { font-size: 0.8rem; color: var(--muted); }
+.fleet-name { margin-bottom:8px; font-size:0.95rem; }
 .badge { display:inline-block; padding:4px 8px; border-radius:9999px; font-size:0.8rem; margin-top:8px; border:1px solid var(--border); }
 .badge.lb.lb-enabled { background:#e6ffed; color:#055e11; border-color:#a7f3d0; }
 .badge.lb.lb-disabled { background:#fff7ed; color:#9a3412; border-color:#fed7aa; }

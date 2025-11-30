@@ -35,6 +35,10 @@ type ActionsMetrics struct {
 	LbId       string
 	LbBackends int
 
+	// Scale target context
+	TargetTotal int
+	StartTotal  int
+
 	// Last error encountered (if any)
 	LastError string
 }
@@ -50,6 +54,8 @@ func Reset(operation string) {
 	now := time.Now()
 	global.StartedAt = now
 	global.LastUpdate = now
+	global.TargetTotal = 0
+	global.StartTotal = 0
 
 	global.LaunchRequested = 0
 	global.LaunchSucceeded = 0
@@ -88,6 +94,21 @@ func SetError(err string) {
 	global.mu.Lock()
 	defer global.mu.Unlock()
 	global.LastError = err
+	global.LastUpdate = time.Now()
+}
+
+// SetScaleTargets sets the starting and target totals for a scale operation.
+func SetScaleTargets(start, target int) {
+	global.mu.Lock()
+	defer global.mu.Unlock()
+	if start < 0 {
+		start = 0
+	}
+	if target < 0 {
+		target = 0
+	}
+	global.StartTotal = start
+	global.TargetTotal = target
 	global.LastUpdate = time.Now()
 }
 
@@ -204,6 +225,8 @@ func Snapshot() map[string]any {
 		"lbEnabled":           global.LbEnabled,
 		"lbId":                global.LbId,
 		"lbBackends":          global.LbBackends,
+		"startTotal":          global.StartTotal,
+		"targetTotal":         global.TargetTotal,
 		"lastError":           global.LastError,
 	}
 	return out

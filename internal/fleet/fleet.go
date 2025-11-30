@@ -75,6 +75,7 @@ func (f *Fleet) Scale(desiredTotal int) error {
 		missing := desiredTotal - remoteCurrent
 
 		metrics.Reset("scale-up")
+		metrics.SetScaleTargets(remoteCurrent, desiredTotal)
 		metrics.SetPhase("launch")
 		metrics.IncLaunchRequested(missing)
 		newInstances := make([]client.InstanceInfo, 0, missing)
@@ -221,6 +222,7 @@ func (f *Fleet) Scale(desiredTotal int) error {
 	}
 
 	metrics.Reset("scale-down")
+	metrics.SetScaleTargets(remoteCurrent, desiredTotal)
 	metrics.SetPhase("terminate")
 	metrics.IncTerminateRequested(len(ids))
 
