@@ -17,6 +17,7 @@ import (
 
 	"fleetctl/internal/client"
 	"fleetctl/internal/config"
+	"fleetctl/internal/diagram"
 	"fleetctl/internal/fleet"
 	"fleetctl/internal/metrics"
 	"fleetctl/internal/state"
@@ -35,6 +36,7 @@ var (
 	flagSyncState      bool
 	flagHTTP           string
 	flagReconcileEvery time.Duration
+	flagDiagram        string
 )
 
 // controlStatus tracks the background control loop state for diagnostics.
@@ -90,10 +92,11 @@ func init() {
 	flag.BoolVar(&flagSyncState, "sync-state", false, "Rebuild local state by querying OCI for instances tagged to this fleet")
 	flag.StringVar(&flagHTTP, "http", "", "Listen address for HTTP API (e.g., :8080). Serves /healthz, /status, /metrics and command endpoints.")
 	flag.DurationVar(&flagReconcileEvery, "reconcile-every", 30*time.Second, "Background reconcile interval for --http mode (e.g., 30s, 1m)")
+	flag.StringVar(&flagDiagram, "diagram", "", "Generate Mermaid diagram (packages, architecture)")
 
 	// Custom usage printer
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "fleetctl %s\n\nUsage:\n  %s [flags]\n\nRequires: --config plus at least one additional flag\n\nFlags:\n", version, os.Args[0])
+		fmt.Fprintf(os.Stderr, "fleetctl %s\n\nUsage:\n  %s [flags]\n\nRequires: --config plus at least one additional flag, or --diagram, or --version\n\nFlags:\n", version, os.Args[0])
 		flag.PrintDefaults()
 	}
 }
@@ -103,6 +106,39 @@ func main() {
 
 	if flagVersion {
 		fmt.Println(version)
+		return
+	}
+
+	// Handle --diagram flag (standalone, doesn't require --config)
+	if flagDiagram != "" {
+		// Determine project root (directory containing go.mod)
+		rootDir, err := findProjectRoot()
+		if err != nil {
+			log.Fatalf("find project root: %v", err)
+		}
+
+		gen, err := diagram.NewGenerator(rootDir)
+		if err != nil {
+			log.Fatalf("init diagram generator: %v", err)
+		}
+
+		var diagType diagram.DiagramType
+		switch strings.ToLower(flagDiagram) {
+		case "packages", "package", "pkg", "deps":
+			diagType = diagram.PackageDeps
+		case "architecture", "arch", "overview":
+			diagType = diagram.Architecture
+		default:
+			fmt.Fprintf(os.Stderr, "Unknown diagram type: %s\n", flagDiagram)
+			fmt.Fprintf(os.Stderr, "Available types: packages, architecture\n")
+			os.Exit(1)
+		}
+
+		output, err := gen.Generate(diagType)
+		if err != nil {
+			log.Fatalf("generate diagram: %v", err)
+		}
+		fmt.Print(output)
 		return
 	}
 
@@ -903,4 +939,25 @@ async function syncState() {
 </script>
 </body>
 </html>`
+}
+
+// findProjectRoot walks up from the current working directory to find go.mod.
+func findProjectRoot() (string, error) {
+	dir, err := os.Getwd()
+	if err != nil {
+		return "", fmt.Errorf("get working directory: %w", err)
+	}
+
+	for {
+		modPath := filepath.Join(dir, "go.mod")
+		if _, err := os.Stat(modPath); err == nil {
+			return dir, nil
+		}
+
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return "", fmt.Errorf("go.mod not found in any parent directory")
+		}
+		dir = parent
+	}
 }

@@ -43,7 +43,7 @@ Fleet(kind=FleetConfig, name=dev-fleet, instances=1)
 
 ## CLI
 
-Invocation rule: Requires --config plus at least one additional flag. If not provided, usage is printed and exit code 1.
+Invocation rule: Requires --config plus at least one additional flag, or --diagram, or --version. If not provided, usage is printed and exit code 1.
 
 Flags (modeled as flags for v0.1.x; may become subcommands later):
 - --config string      Path to YAML config (default "fleet.yaml")
@@ -52,6 +52,7 @@ Flags (modeled as flags for v0.1.x; may become subcommands later):
 - --auth-validate      Validate OCI authentication (performs a lightweight IAM call)
 - --status             Print tracked fleet state from local store and exit
 - --state string       Path to local state JSON (default ".fleetctl/state.json")
+- --diagram string     Generate Mermaid diagram of codebase (packages, architecture)
 - --version            Print version and exit
 
 Examples:
@@ -63,6 +64,10 @@ Examples:
   make run ARGS="--config fleet.yaml --rolling-restart"
 - Auth validation:
   make run ARGS="--config fleet.yaml --auth-validate"
+- Generate package dependency diagram:
+  ./bin/fleetctl --diagram packages
+- Generate architecture diagram:
+  ./bin/fleetctl --diagram architecture
 
 Exit Codes:
 - 0: success
@@ -270,9 +275,29 @@ Project layout:
 - internal/config/    Config parsing and types
 - internal/client/    OCI client wrapper (stub)
 - internal/fleet/     Fleet logic (stubs + summary)
+- internal/diagram/   Code diagram generation
 - schema/             JSON schema for config
 - config/             Config templates
 - docs/               Documentation and specs (living)
+
+## Diagram Generation
+
+Generate Mermaid diagrams from the codebase for documentation and analysis:
+
+Available diagram types:
+- `packages` (aliases: `package`, `pkg`, `deps`) - Package dependency graph showing internal imports
+- `architecture` (aliases: `arch`, `overview`) - High-level architecture diagram
+
+Examples:
+```bash
+# Generate package dependency diagram
+./bin/fleetctl --diagram packages > docs/packages.md
+
+# Generate architecture diagram
+./bin/fleetctl --diagram architecture > docs/architecture.md
+```
+
+The output is Mermaid markdown that can be rendered by GitHub, GitLab, or any Mermaid-compatible viewer.
 
 ## Functional Specification (Living Doc)
 
