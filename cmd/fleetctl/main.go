@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"html"
 	"log"
 	"net/http"
 	"os"
@@ -265,6 +266,18 @@ func startHTTPServer(f *fleet.Fleet, st *state.Store, cfg *config.FleetConfig, a
 				remoteActive = len(inst)
 			}
 		}
+		var lbSnapshot any
+		if lb, ok, _ := st.GetLBInfo(cfg.Metadata.Name); ok {
+			lbSnapshot = map[string]any{
+				"enabled":       lb.Enabled,
+				"id":            lb.ID,
+				"backendSet":    lb.BackendSet,
+				"listener":      lb.Listener,
+				"backends":      lb.Backends,
+				"backendsCount": lb.BackendsCount,
+				"updatedAt":     lb.UpdatedAt.Format(time.RFC3339),
+			}
+		}
 		resp := map[string]any{
 			"fleet":        cfg.Metadata.Name,
 			"localActive":  localActive,
@@ -272,6 +285,7 @@ func startHTTPServer(f *fleet.Fleet, st *state.Store, cfg *config.FleetConfig, a
 			"timestamp":    time.Now().Format(time.RFC3339),
 			"control":      ctrlStatus.snapshot(),
 			"actions":      metrics.Snapshot(),
+			"lb":           lbSnapshot,
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(resp)
@@ -380,11 +394,79 @@ func startHTTPServer(f *fleet.Fleet, st *state.Store, cfg *config.FleetConfig, a
 					"<div class='grid3'><div><div class='label'>Desired</div><div class='value'>%d</div></div><div><div class='label'>Remote</div><div class='value'>%d</div></div><div><div class='label'>Local</div><div class='value'>%d</div></div></div>",
 					desired, remoteActive, localActive,
 				)
+				// minimums from config (sum and per-group)
+				minTotal := 0
+				var groupParts []string
+				for _, g := range f.Config.Spec.Instances {
+					minTotal += g.Count
+					if g.Count > 0 {
+						name := g.Name
+						if name == "" {
+							name = "group"
+						}
+						groupParts = append(groupParts, fmt.Sprintf("%s:%d", name, g.Count))
+					}
+				}
+				minimumsHTML := fmt.Sprintf("<div class='minimums'><div class='label'>Minimums</div><div class='value'>%d</div><div class='groups'>%s</div></div>", minTotal, html.EscapeString(strings.Join(groupParts, " ")))
 
 				// metrics HTML
 				act := metrics.Snapshot()
 				actJSON, _ := json.MarshalIndent(act, "", "  ")
 				metricsHTML := "<pre>" + string(actJSON) + "</pre>"
+
+				// LB badge HTML derived from metrics
+				lbEnabled := false
+				lbBackends := 0
+				if v, ok := act["lbEnabled"].(bool); ok {
+					lbEnabled = v
+				}
+				if v, ok := act["lbBackends"].(int); ok {
+					lbBackends = v
+				} else if df, ok := act["lbBackends"].(float64); ok {
+					lbBackends = int(df)
+				}
+				lbBadgeHTML := ""
+				if lbEnabled {
+					lbBadgeHTML = fmt.Sprintf("<div class='badge lb lb-enabled'>LB %d backends</div>", lbBackends)
+				} else {
+					lbBadgeHTML = "<div class='badge lb lb-disabled'>LB disabled</div>"
+				}
+				// Scaling badge HTML derived from metrics.operation
+				op := ""
+				if v, ok := act["operation"].(string); ok {
+					op = v
+				}
+				scaleBadgeHTML := ""
+				switch strings.ToLower(op) {
+				case "scale-up":
+					scaleBadgeHTML = "<div class='badge scale scale-up'>Scaling up</div>"
+				case "scale-down":
+					scaleBadgeHTML = "<div class='badge scale scale-down'>Scaling down</div>"
+				default:
+					scaleBadgeHTML = "<div class='badge scale scale-idle'>Scaling idle</div>"
+				}
+
+				// Rolling restart badge HTML derived from metrics during active operation
+				rrBadgeHTML := ""
+				if strings.ToLower(op) == "rolling-restart" {
+					idx := 0
+					total := 0
+					if v, ok := act["rollingRestartIndex"].(int); ok {
+						idx = v
+					} else if df, ok := act["rollingRestartIndex"].(float64); ok {
+						idx = int(df)
+					}
+					if v, ok := act["rollingRestartTotal"].(int); ok {
+						total = v
+					} else if df, ok := act["rollingRestartTotal"].(float64); ok {
+						total = int(df)
+					}
+					if total > 0 {
+						rrBadgeHTML = fmt.Sprintf("<div class='badge rr rr-in-progress'>Rolling restart %d/%d</div>", idx, total)
+					} else {
+						rrBadgeHTML = "<div class='badge rr rr-in-progress'>Rolling restart</div>"
+					}
+				}
 
 				// control HTML
 				ctrlJSON, _ := json.MarshalIndent(ctrl, "", "  ")
@@ -398,7 +480,7 @@ func startHTTPServer(f *fleet.Fleet, st *state.Store, cfg *config.FleetConfig, a
 					}
 					fmt.Fprint(w, "\n")
 				}
-				writeEvent("status", statusHTML)
+				writeEvent("status", statusHTML+minimumsHTML+lbBadgeHTML+scaleBadgeHTML+rrBadgeHTML)
 				writeEvent("metrics", metricsHTML)
 				writeEvent("control", controlHTML)
 				fl.Flush()
@@ -463,12 +545,19 @@ func startControlLoop(f *fleet.Fleet, cfgPath string, every time.Duration) {
 				log.Printf("control: stat config error: %v", err)
 			}
 
-			// 2) Determine desired total from config
+			// 2) Determine desired total from config, then apply lower-bound from local state (only scale up)
 			desired := 0
 			for _, g := range f.Config.Spec.Instances {
 				desired += g.Count
 			}
-			ctrlStatus.set(func(c *controlStatus) { c.Desired = desired })
+			// baseline from local state: do not go below what's tracked locally
+			target := desired
+			if f.Store != nil {
+				if la, err := f.Store.CountActive(f.Config.Metadata.Name); err == nil && la > target {
+					target = la
+				}
+			}
+			ctrlStatus.set(func(c *controlStatus) { c.Desired = target })
 
 			// 3) Compare actual vs desired and reconcile if needed
 			if f.Client != nil {
@@ -482,17 +571,28 @@ func startControlLoop(f *fleet.Fleet, cfgPath string, every time.Duration) {
 						c.Actual = actual
 						c.LastError = ""
 					})
-					if actual != desired {
-						ctrlStatus.set(func(c *controlStatus) { c.LastAction = fmt.Sprintf("scale to %d", desired) })
-						log.Printf("control: reconciling desired=%d actual=%d", desired, actual)
-						if err := f.Scale(desired); err != nil {
+					if actual < target {
+						ctrlStatus.set(func(c *controlStatus) { c.LastAction = fmt.Sprintf("scale up to %d", target) })
+						log.Printf("control: scaling up to meet target; target=%d actual=%d", target, actual)
+						if err := f.Scale(target); err != nil {
 							ctrlStatus.set(func(c *controlStatus) { c.LastError = err.Error() })
-							log.Printf("control: scale to %d failed: %v", desired, err)
+							log.Printf("control: scale up to %d failed: %v", target, err)
 						}
 					} else {
 						ctrlStatus.set(func(c *controlStatus) { c.LastAction = "noop" })
-						log.Printf("control: desired matches actual (%d); no action", actual)
+						log.Printf("control: actual (%d) meets or exceeds target (%d); no downscale", actual, target)
 					}
+				}
+			}
+
+			// 4) Load balancer reconcile every tick
+			if f.Client != nil {
+				ctrlStatus.set(func(c *controlStatus) { c.LastAction = "lb-reconcile" })
+				if err := f.ReconcileLoadBalancer(context.Background()); err != nil {
+					ctrlStatus.set(func(c *controlStatus) { c.LastError = err.Error() })
+					log.Printf("control: lb reconcile error: %v", err)
+				} else {
+					ctrlStatus.set(func(c *controlStatus) { c.LastError = "" })
 				}
 			}
 
@@ -641,6 +741,15 @@ button:hover, .btn:hover { background: var(--chip); }
 pre { background: #f7f7f7; padding: 12px; overflow: auto; border-radius: 6px; }
 .kv { display: grid; grid-template-columns: 160px 1fr; gap: 6px; }
 .ts { font-size: 0.8rem; color: var(--muted); }
+.badge { display:inline-block; padding:4px 8px; border-radius:9999px; font-size:0.8rem; margin-top:8px; border:1px solid var(--border); }
+.badge.lb.lb-enabled { background:#e6ffed; color:#055e11; border-color:#a7f3d0; }
+.badge.lb.lb-disabled { background:#fff7ed; color:#9a3412; border-color:#fed7aa; }
+.badge.scale.scale-up { background:#e6ffed; color:#065f46; border-color:#a7f3d0; }
+.badge.scale.scale-down { background:#fef3c7; color:#92400e; border-color:#fcd34d; }
+.badge.scale.scale-idle { background:#f3f4f6; color:#374151; border-color:#e5e7eb; }
+.badge.rr.rr-in-progress { background:#dbeafe; color:#1e40af; border-color:#bfdbfe; }
+.minimums { margin-top:8px; padding:8px; background: var(--chip); border:1px solid var(--border); border-radius:6px; }
+.minimums .groups { font-size:0.8rem; color: var(--muted); margin-top:4px; }
 </style>
 </head>
 <body hx-ext="sse" sse-connect="/events">

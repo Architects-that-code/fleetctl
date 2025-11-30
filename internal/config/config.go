@@ -20,15 +20,16 @@ type Metadata struct {
 }
 
 type Spec struct {
-	CompartmentID      string       `yaml:"compartmentId"`
-	ImageID            string       `yaml:"imageId"`
-	AvailabilityDomain string       `yaml:"availabilityDomain"`
-	Shape              string       `yaml:"shape"`
-	ShapeConfig        *ShapeConfig `yaml:"shapeConfig"` // required when using Flex shapes
-	SubnetID           string       `yaml:"subnetId"`
-	DisplayNamePrefix  string       `yaml:"displayNamePrefix"`
-	Scaling            Scaling      `yaml:"scaling"` // optional scaling configuration (bounded concurrency)
-	Auth               Auth         `yaml:"auth"`
+	CompartmentID      string           `yaml:"compartmentId"`
+	ImageID            string           `yaml:"imageId"`
+	AvailabilityDomain string           `yaml:"availabilityDomain"`
+	Shape              string           `yaml:"shape"`
+	ShapeConfig        *ShapeConfig     `yaml:"shapeConfig"` // required when using Flex shapes
+	SubnetID           string           `yaml:"subnetId"`
+	DisplayNamePrefix  string           `yaml:"displayNamePrefix"`
+	Scaling            Scaling          `yaml:"scaling"` // optional scaling configuration (bounded concurrency)
+	LoadBalancer       LoadBalancerSpec `yaml:"loadBalancer"`
+	Auth               Auth             `yaml:"auth"`
 	// ... other fields
 	DefinedTags  map[string]string `yaml:"definedTags"` // or a more complex type
 	FreeformTags map[string]string `yaml:"freeformTags"`
@@ -51,6 +52,19 @@ type ShapeConfig struct {
 type Scaling struct {
 	ParallelLaunch    int `yaml:"parallelLaunch"`    // max concurrent launches; default applied if zero
 	ParallelTerminate int `yaml:"parallelTerminate"` // max concurrent terminations; default applied if zero
+}
+
+// LoadBalancerSpec defines configuration for the OCI Load Balancer.
+type LoadBalancerSpec struct {
+	Enabled          bool   `yaml:"enabled"`
+	SubnetID         string `yaml:"subnetId"`
+	IsPrivate        bool   `yaml:"isPrivate"`
+	ListenerPort     int    `yaml:"listenerPort"`
+	BackendPort      int    `yaml:"backendPort"`
+	MinBandwidthMbps int    `yaml:"minBandwidthMbps"`
+	MaxBandwidthMbps int    `yaml:"maxBandwidthMbps"`
+	HealthPath       string `yaml:"healthPath"`
+	Policy           string `yaml:"policy"`
 }
 
 type Auth struct {

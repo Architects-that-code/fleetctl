@@ -30,6 +30,11 @@ type ActionsMetrics struct {
 	RollingRestartIndex int // 1-based index of current item
 	RollingRestartTotal int
 
+	// Load Balancer snapshot
+	LbEnabled  bool
+	LbId       string
+	LbBackends int
+
 	// Last error encountered (if any)
 	LastError string
 }
@@ -62,7 +67,12 @@ func Reset(operation string) {
 
 // Done marks the current operation as completed.
 func Done() {
-	SetPhase("done")
+	global.mu.Lock()
+	defer global.mu.Unlock()
+	global.Phase = "done"
+	// Clear operation so UI badge shows "Scaling idle" until next Reset()
+	global.Operation = ""
+	global.LastUpdate = time.Now()
 }
 
 // SetPhase updates the current phase.
@@ -150,6 +160,30 @@ func SetRollingRestart(index, total int) {
 	global.LastUpdate = time.Now()
 }
 
+// UpdateLB sets the load balancer snapshot fields.
+func UpdateLB(enabled bool, id string, backends int) {
+	global.mu.Lock()
+	defer global.mu.Unlock()
+	global.LbEnabled = enabled
+	global.LbId = id
+	if backends < 0 {
+		backends = 0
+	}
+	global.LbBackends = backends
+	global.LastUpdate = time.Now()
+}
+
+// SetLBBackends updates just the backend count (e.g., during reconcile).
+func SetLBBackends(n int) {
+	global.mu.Lock()
+	defer global.mu.Unlock()
+	if n < 0 {
+		n = 0
+	}
+	global.LbBackends = n
+	global.LastUpdate = time.Now()
+}
+
 // Snapshot returns a copy of current metrics suitable for JSON encoding.
 func Snapshot() map[string]any {
 	global.mu.RLock()
@@ -167,6 +201,9 @@ func Snapshot() map[string]any {
 		"terminateFailed":     global.TerminateFailed,
 		"rollingRestartIndex": global.RollingRestartIndex,
 		"rollingRestartTotal": global.RollingRestartTotal,
+		"lbEnabled":           global.LbEnabled,
+		"lbId":                global.LbId,
+		"lbBackends":          global.LbBackends,
 		"lastError":           global.LastError,
 	}
 	return out

@@ -45,6 +45,30 @@ type InstanceInfo struct {
 	Lifecycle   string
 }
 
+// Backoff/retry helpers for transient throttling (HTTP 429) on compute APIs.
+func isThrottleError(err error) bool {
+	if err == nil {
+		return false
+	}
+	le := strings.ToLower(err.Error())
+	return strings.Contains(le, "too many requests") || strings.Contains(le, "429") || strings.Contains(le, "rate limit")
+}
+
+func backoffDelay(attempt int) time.Duration {
+	if attempt < 1 {
+		attempt = 1
+	}
+	d := 500 * time.Millisecond
+	for i := 1; i < attempt; i++ {
+		d *= 2
+		if d >= 8*time.Second {
+			d = 8 * time.Second
+			break
+		}
+	}
+	return d
+}
+
 // New initializes an OCI client using either:
 // - User principal (OCI config file) when auth.Method == "user"
 // - Instance principal when auth.Method == "instance" or empty
@@ -417,12 +441,26 @@ func (c *Client) ListInstancesByFleet(ctx context.Context, compartmentId, fleetN
 	var out []InstanceInfo
 	var page *string
 	for {
-		resp, err := cc.ListInstances(ctx, core.ListInstancesRequest{
-			CompartmentId: &compartmentId,
-			Page:          page,
-		})
-		if err != nil {
-			return nil, fmt.Errorf("list instances: %w", err)
+		var resp core.ListInstancesResponse
+		var liErr error
+		for attempt := 1; attempt <= 5; attempt++ {
+			r, e := cc.ListInstances(ctx, core.ListInstancesRequest{
+				CompartmentId: &compartmentId,
+				Page:          page,
+			})
+			if e == nil {
+				resp = r
+				liErr = nil
+				break
+			}
+			if !isThrottleError(e) {
+				return nil, fmt.Errorf("list instances: %w", e)
+			}
+			liErr = e
+			time.Sleep(backoffDelay(attempt))
+		}
+		if liErr != nil {
+			return nil, fmt.Errorf("list instances: %w", liErr)
 		}
 		for _, it := range resp.Items {
 			// Skip terminated
@@ -486,6 +524,68 @@ func (c *Client) TerminateInstances(ctx context.Context, ids []string) error {
 		}
 	}
 	return nil
+}
+
+func (c *Client) InstancePrimaryPrivateIP(ctx context.Context, compartmentId, instanceId string) (string, error) {
+	if c == nil || c.Provider == nil {
+		return "", fmt.Errorf("client not initialized")
+	}
+	// Compute client for listing VNIC attachments
+	cc, err := core.NewComputeClientWithConfigurationProvider(c.Provider)
+	if err != nil {
+		return "", fmt.Errorf("compute client init: %w", err)
+	}
+	if c.Region != "" {
+		cc.SetRegion(c.Region)
+	}
+
+	// Find primary (or first attached) VNIC attachment for this instance
+	var page *string
+	var firstAtt *core.VnicAttachment
+	for {
+		resp, err := cc.ListVnicAttachments(ctx, core.ListVnicAttachmentsRequest{
+			CompartmentId: &compartmentId,
+			InstanceId:    &instanceId,
+			Page:          page,
+		})
+		if err != nil {
+			return "", fmt.Errorf("list vnic attachments: %w", err)
+		}
+		for _, va := range resp.Items {
+			att := va // capture
+			if va.LifecycleState == core.VnicAttachmentLifecycleStateAttached {
+				if firstAtt == nil {
+					firstAtt = &att
+				}
+			}
+		}
+		if resp.OpcNextPage == nil || *resp.OpcNextPage == "" {
+			break
+		}
+		page = resp.OpcNextPage
+	}
+	chosen := firstAtt
+	if chosen == nil || chosen.VnicId == nil || *chosen.VnicId == "" {
+		return "", fmt.Errorf("no VNIC attachment found for instance %s", instanceId)
+	}
+
+	// Virtual network client to query the VNIC
+	vnc, err := core.NewVirtualNetworkClientWithConfigurationProvider(c.Provider)
+	if err != nil {
+		return "", fmt.Errorf("virtual network client init: %w", err)
+	}
+	if c.Region != "" {
+		vnc.SetRegion(c.Region)
+	}
+	vnicID := *chosen.VnicId
+	vnicResp, err := vnc.GetVnic(ctx, core.GetVnicRequest{VnicId: &vnicID})
+	if err != nil {
+		return "", fmt.Errorf("get vnic %s: %w", vnicID, err)
+	}
+	if vnicResp.Vnic.PrivateIp == nil || *vnicResp.Vnic.PrivateIp == "" {
+		return "", fmt.Errorf("vnic %s has no private IP", vnicID)
+	}
+	return *vnicResp.Vnic.PrivateIp, nil
 }
 
 // Validate performs a lightweight API call to verify auth works.

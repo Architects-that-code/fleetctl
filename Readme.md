@@ -143,6 +143,58 @@ Note on Rancher Fleet extension warnings:
 
 Note: .fleetctl/ is excluded in .gitignore and should not be committed.
 
+## HTTP UI
+
+Run fleetctl in HTTP mode to get a minimal web UI and SSE live updates.
+
+Start the daemon:
+- make run ARGS="--config fleet.local.yaml --http :8080 --reconcile-every 30s"
+- Or: ./bin/fleetctl --config fleet.local.yaml --http :8080 --reconcile-every 30s
+
+Endpoints:
+- GET /               Minimal UI (status grid, badges, controls)
+- GET /healthz        Liveness probe
+- GET /status         Local vs Remote (OCI) comparison text
+- GET /metrics        JSON metrics including control loop snapshot and action metrics
+- GET /control        Control loop status JSON
+- GET /events         Server-Sent Events stream used by the UI
+- POST /scale         Body: {"desired": N}
+- POST /rolling-restart
+- POST /sync-state
+- GET /openapi.json   OpenAPI 3.0 schema for the HTTP API
+
+Badges (UI):
+- Load Balancer badge:
+  - "LB disabled" when spec.loadBalancer.enabled is false
+  - "LB X backends" when enabled and reconciled; X reflects current backend count
+- Scaling badge (always visible):
+  - "Scaling up" when current operation == "scale-up"
+  - "Scaling down" when current operation == "scale-down"
+  - "Scaling idle" otherwise
+
+Control loop policy (only scale up automatically):
+- desiredFromConfig = sum(spec.instances[].count)
+- localBaseline = active count from the local state store
+- target = max(desiredFromConfig, localBaseline)
+- If actual < target: scale up to target
+- If actual >= target: no automatic downscale
+- Load balancer backends are reconciled every control loop tick
+
+Notes:
+- You can still downscale explicitly with POST /scale and a lower desired; this performs LB deregistration before terminating instances. The control loop itself will not automatically downscale below the local baseline.
+- UI controls:
+  - Set the "Desired total" and click "Scale" to trigger scale actions
+  - "Rolling Restart" replaces instances one-by-one and updates LB backends accordingly
+  - "Sync State" rebuilds the local store from OCI discovery
+
+Examples:
+- Scale to 3:
+  curl -sS -X POST localhost:8080/scale -H 'Content-Type: application/json' -d '{"desired":3}'
+- Rolling restart:
+  curl -sS -X POST localhost:8080/rolling-restart
+- Sync state:
+  curl -sS -X POST localhost:8080/sync-state
+
 ## Development
 
 Common targets:

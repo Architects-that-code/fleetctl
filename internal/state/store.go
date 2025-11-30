@@ -26,10 +26,22 @@ type InstanceRecord struct {
 	UpdatedAt time.Time `json:"updatedAt"`
 }
 
-// FleetState captures tracked instances for a named fleet.
+// LBState captures load balancer snapshot for a fleet.
+type LBState struct {
+	Enabled       bool      `json:"enabled"`
+	ID            string    `json:"id"`
+	BackendSet    string    `json:"backendSet"`
+	Listener      string    `json:"listener"`
+	Backends      []string  `json:"backends,omitempty"`
+	BackendsCount int       `json:"backendsCount"`
+	UpdatedAt     time.Time `json:"updatedAt"`
+}
+
+// FleetState captures tracked instances and LB snapshot for a named fleet.
 type FleetState struct {
 	FleetName string           `json:"fleetName"`
 	Instances []InstanceRecord `json:"instances"`
+	LB        *LBState         `json:"lb,omitempty"`
 	UpdatedAt time.Time        `json:"updatedAt"`
 }
 
@@ -349,4 +361,125 @@ func (s *Store) ResetFleetActive(fleetName string, records []InstanceRecord) err
 		UpdatedAt: now,
 	}
 	return s.save(r)
+}
+
+// LB persistence helpers
+
+// SetLBInfo upserts the LB identity and enabled flag for the fleet.
+func (s *Store) SetLBInfo(fleetName string, enabled bool, id, backendSet, listener string) error {
+	now := time.Now()
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	r, err := s.load()
+	if err != nil {
+		return err
+	}
+	fs := r.Fleets[fleetName]
+	fs.FleetName = fleetName
+
+	if fs.LB == nil {
+		fs.LB = &LBState{}
+	}
+	fs.LB.Enabled = enabled
+	fs.LB.ID = id
+	fs.LB.BackendSet = backendSet
+	fs.LB.Listener = listener
+	fs.LB.UpdatedAt = now
+
+	fs.UpdatedAt = now
+	r.Fleets[fleetName] = fs
+	return s.save(r)
+}
+
+// SetLBBackends sets the current backend IPs and count for the fleet LB.
+func (s *Store) SetLBBackends(fleetName string, ips []string) error {
+	now := time.Now()
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	r, err := s.load()
+	if err != nil {
+		return err
+	}
+	fs := r.Fleets[fleetName]
+	fs.FleetName = fleetName
+
+	if fs.LB == nil {
+		fs.LB = &LBState{}
+	}
+	dst := make([]string, len(ips))
+	copy(dst, ips)
+	fs.LB.Backends = dst
+	fs.LB.BackendsCount = len(dst)
+	fs.LB.UpdatedAt = now
+
+	fs.UpdatedAt = now
+	r.Fleets[fleetName] = fs
+	return s.save(r)
+}
+
+// SetLBBackendsCount updates only the backend count (when IPs are not readily available).
+func (s *Store) SetLBBackendsCount(fleetName string, n int) error {
+	now := time.Now()
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	r, err := s.load()
+	if err != nil {
+		return err
+	}
+	fs := r.Fleets[fleetName]
+	fs.FleetName = fleetName
+
+	if fs.LB == nil {
+		fs.LB = &LBState{}
+	}
+	if n < 0 {
+		n = 0
+	}
+	fs.LB.BackendsCount = n
+	fs.LB.UpdatedAt = now
+
+	fs.UpdatedAt = now
+	r.Fleets[fleetName] = fs
+	return s.save(r)
+}
+
+// ClearLB removes any LB snapshot from state (e.g., when LB disabled).
+func (s *Store) ClearLB(fleetName string) error {
+	now := time.Now()
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	r, err := s.load()
+	if err != nil {
+		return err
+	}
+	fs := r.Fleets[fleetName]
+	fs.FleetName = fleetName
+	fs.LB = nil
+	fs.UpdatedAt = now
+	r.Fleets[fleetName] = fs
+	return s.save(r)
+}
+
+// GetLBInfo returns the LB snapshot for the fleet, if present.
+func (s *Store) GetLBInfo(fleetName string) (LBState, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	r, err := s.load()
+	if err != nil {
+		return LBState{}, false, err
+	}
+	fs := r.Fleets[fleetName]
+	if fs.LB == nil {
+		return LBState{}, false, nil
+	}
+	return *fs.LB, true, nil
 }
