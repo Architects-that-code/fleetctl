@@ -21,6 +21,7 @@ type Fleet struct {
 	Config config.FleetConfig
 	Client *client.Client
 	Store  *state.Store
+	opMu   sync.Mutex
 }
 
 // New creates a new Fleet instance
@@ -40,6 +41,12 @@ func (f *Fleet) Scale(desiredTotal int) error {
 	if f.Client == nil {
 		return fmt.Errorf("OCI client not initialized")
 	}
+
+	f.opMu.Lock()
+	defer f.opMu.Unlock()
+
+	// dequeue only if this desired is at the head of the queue (FIFO)
+	metrics.PopScaleQueueIfHead(desiredTotal)
 
 	ctx := context.Background()
 	fleetName := f.Config.Metadata.Name
@@ -173,13 +180,17 @@ func (f *Fleet) Scale(desiredTotal int) error {
 		if err := f.SyncState(); err != nil {
 			return fmt.Errorf("sync state after scale up: %w", err)
 		}
+		// Post-scale LB reconcile to ensure metrics reflect actual backend count
+		if err := f.ReconcileLoadBalancer(ctx); err != nil {
+			log.Printf("post-scale LB reconcile (up): %v", err)
+		}
 		metrics.Done()
 		return nil
 	}
 
-	// Scale down: terminate excess instances in OCI (LIFO from local state)
+	// Scale down: terminate excess instances in OCI (FIFO from local state; remove oldest first)
 	toRemove := current - desiredTotal
-	recs, err := f.Store.ActiveRecordsLIFO(fleetName, toRemove)
+	recs, err := f.Store.ActiveRecordsFIFO(fleetName, toRemove)
 	if err != nil {
 		return fmt.Errorf("select instances to remove: %w", err)
 	}
@@ -195,7 +206,25 @@ func (f *Fleet) Scale(desiredTotal int) error {
 		if lbID, bsName, lsn, err := lbs.Ensure(ctx, f.Config); err != nil {
 			log.Printf("LB ensure failed (scale-down): %v", err)
 		} else {
+			// Optimistically update LB metrics to reflect immediate backend removals
+			snap := metrics.Snapshot()
+			curr := 0
+			if v, ok := snap["lbBackends"].(int); ok {
+				curr = v
+			} else if df, ok := snap["lbBackends"].(float64); ok {
+				curr = int(df)
+			}
 			for _, id := range ids {
+				// optimistic decrement before initiating removal
+				if curr > 0 {
+					curr--
+				}
+				metrics.UpdateLB(true, lbID, curr)
+				if f.Store != nil {
+					_ = f.Store.SetLBInfo(fleetName, true, lbID, bsName, lsn)
+					_ = f.Store.SetLBBackendsCount(fleetName, curr)
+				}
+
 				ip, ierr := f.Client.InstancePrimaryPrivateIP(ctx, f.Config.Spec.CompartmentID, id)
 				if ierr != nil {
 					log.Printf("LB resolve IP for %s: %v", id, ierr)
@@ -205,6 +234,7 @@ func (f *Fleet) Scale(desiredTotal int) error {
 					log.Printf("LB remove backend %s:%d: %v", ip, spec.BackendPort, err)
 				}
 			}
+			// After removals, refresh authoritative count
 			if n, cerr := lbs.CountBackends(ctx, lbID, bsName); cerr == nil {
 				metrics.UpdateLB(true, lbID, n)
 				if f.Store != nil {
@@ -270,6 +300,10 @@ func (f *Fleet) Scale(desiredTotal int) error {
 	}
 	if err := f.SyncState(); err != nil {
 		return fmt.Errorf("sync state after scale down: %w", err)
+	}
+	// Post-scale LB reconcile to ensure metrics reflect actual backend count
+	if err := f.ReconcileLoadBalancer(ctx); err != nil {
+		log.Printf("post-scale LB reconcile (down): %v", err)
 	}
 	metrics.Done()
 	return nil
@@ -403,6 +437,8 @@ func (f *Fleet) RollingRestart() error {
 	if f.Client == nil {
 		return fmt.Errorf("OCI client not initialized")
 	}
+	f.opMu.Lock()
+	defer f.opMu.Unlock()
 	ctx := context.Background()
 	fleetName := f.Config.Metadata.Name
 
@@ -430,6 +466,7 @@ func (f *Fleet) RollingRestart() error {
 		lbID   string
 		bsName string
 		lsn    string
+		lbCurr int
 	)
 	if lbEnabled {
 		lbs = lb.New(f.Client.Provider, f.Client.Region)
@@ -438,6 +475,13 @@ func (f *Fleet) RollingRestart() error {
 			lbEnabled = false
 		} else {
 			lbID, bsName, lsn = id, bs, l
+			// initialize current LB backend count from metrics snapshot
+			snap := metrics.Snapshot()
+			if v, ok := snap["lbBackends"].(int); ok {
+				lbCurr = v
+			} else if df, ok := snap["lbBackends"].(float64); ok {
+				lbCurr = int(df)
+			}
 		}
 	}
 
@@ -448,6 +492,14 @@ func (f *Fleet) RollingRestart() error {
 		// If LB enabled, deregister this backend before termination
 		if lbEnabled {
 			spec := f.Config.Spec.LoadBalancer
+			// optimistic decrement before initiating removal
+			if lbCurr > 0 {
+				lbCurr--
+			}
+			metrics.UpdateLB(true, lbID, lbCurr)
+			if f.Store != nil {
+				_ = f.Store.SetLBBackendsCount(fleetName, lbCurr)
+			}
 			if ip, err := f.Client.InstancePrimaryPrivateIP(ctx, f.Config.Spec.CompartmentID, r.ID); err == nil {
 				if err := lbs.RemoveBackend(ctx, lbID, bsName, ip, spec.BackendPort); err != nil {
 					log.Printf("LB remove backend %s:%d: %v", ip, spec.BackendPort, err)
@@ -567,8 +619,18 @@ func (f *Fleet) ReconcileLoadBalancer(ctx context.Context) error {
 	}
 
 	// Remove stale
+	curr := len(current)
 	for ip := range current {
 		if _, ok := desired[ip]; !ok {
+			// optimistic decrement before initiating removal
+			if curr > 0 {
+				curr--
+			}
+			metrics.UpdateLB(true, lbID, curr)
+			if f.Store != nil {
+				_ = f.Store.SetLBInfo(f.Config.Metadata.Name, true, lbID, bsName, lsn)
+				_ = f.Store.SetLBBackendsCount(f.Config.Metadata.Name, curr)
+			}
 			if err := lbs.RemoveBackend(ctx, lbID, bsName, ip, spec.BackendPort); err != nil {
 				log.Printf("LB remove stale %s: %v", ip, err)
 			}

@@ -39,6 +39,9 @@ type ActionsMetrics struct {
 	TargetTotal int
 	StartTotal  int
 
+	// Queue of requested future scale targets (for UI)
+	ScaleQueue []int
+
 	// Last error encountered (if any)
 	LastError string
 }
@@ -206,6 +209,72 @@ func SetLBBackends(n int) {
 }
 
 // Snapshot returns a copy of current metrics suitable for JSON encoding.
+// AppendScaleQueue appends a desired target to the queue.
+func AppendScaleQueue(v int) {
+	global.mu.Lock()
+	defer global.mu.Unlock()
+	if v < 0 {
+		return
+	}
+	global.ScaleQueue = append(global.ScaleQueue, v)
+	global.LastUpdate = time.Now()
+}
+
+// RemoveScaleQueueValue removes the first occurrence of v from the queue.
+func RemoveScaleQueueValue(v int) {
+	global.mu.Lock()
+	defer global.mu.Unlock()
+	for i, x := range global.ScaleQueue {
+		if x == v {
+			global.ScaleQueue = append(global.ScaleQueue[:i], global.ScaleQueue[i+1:]...)
+			break
+		}
+	}
+	global.LastUpdate = time.Now()
+}
+
+// PeekScaleQueue returns the head value without removing it.
+func PeekScaleQueue() (int, bool) {
+	global.mu.RLock()
+	defer global.mu.RUnlock()
+	if len(global.ScaleQueue) == 0 {
+		return 0, false
+	}
+	return global.ScaleQueue[0], true
+}
+
+// PopScaleQueue removes and returns the head value (FIFO). Returns false if empty.
+func PopScaleQueue() (int, bool) {
+	global.mu.Lock()
+	defer global.mu.Unlock()
+	if len(global.ScaleQueue) == 0 {
+		global.LastUpdate = time.Now()
+		return 0, false
+	}
+	v := global.ScaleQueue[0]
+	// re-slice with a fresh backing array to avoid retaining references
+	global.ScaleQueue = append([]int{}, global.ScaleQueue[1:]...)
+	global.LastUpdate = time.Now()
+	return v, true
+}
+
+// PopScaleQueueIfHead pops the head only if it matches expected. Returns true on pop.
+func PopScaleQueueIfHead(expected int) bool {
+	global.mu.Lock()
+	defer global.mu.Unlock()
+	if len(global.ScaleQueue) == 0 {
+		global.LastUpdate = time.Now()
+		return false
+	}
+	if global.ScaleQueue[0] == expected {
+		global.ScaleQueue = append([]int{}, global.ScaleQueue[1:]...)
+		global.LastUpdate = time.Now()
+		return true
+	}
+	global.LastUpdate = time.Now()
+	return false
+}
+
 func Snapshot() map[string]any {
 	global.mu.RLock()
 	defer global.mu.RUnlock()
@@ -228,6 +297,7 @@ func Snapshot() map[string]any {
 		"startTotal":          global.StartTotal,
 		"targetTotal":         global.TargetTotal,
 		"lastError":           global.LastError,
+		"scaleQueue":          append([]int{}, global.ScaleQueue...),
 	}
 	return out
 }

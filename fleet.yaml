@@ -8,10 +8,10 @@ metadata:
   name: local-dev-fleet
 spec:
   # REQUIRED: OCI Compartment OCID where instances would be managed
-  compartmentId: "ocid1.compartment.oc1.."
+  compartmentId: "ocid1.compartment.oc1..aaaaaaaark7rip4ebhxqka3tbtlzd5qpfmtrwdgdm345bx7ud34ynhodlaoa"
 
   # REQUIRED: OCI Image OCID to use when creating instances
-  imageId: "ocid1.image.oc1.iad."
+  imageId: "ocid1.image.oc1.iad.aaaaaaaalbyf7m5dvdcaujoj5wplgqepqlodgkxznrzrmmdawqoqzperwtga"
 
   # OPTIONAL: Availability Domain (e.g., PHX-AD-1)
   # Leave empty to auto-resolve an AD in the configured region
@@ -22,13 +22,13 @@ spec:
     ocpus: 2
     memoryInGBs: 16
   # REQUIRED: Subnet OCID for the primary VNIC (default for groups unless overridden)
-  subnetId: "ocid1.subnet.oc1.iad."
+  subnetId: "ocid1.subnet.oc1.iad.aaaaaaaa3mjqpf4ddhccc4mdgwsj3bgotl5w2l72lc447zo3qzx4smsadexa"
   scaling:
     parallelLaunch: 10
     parallelTerminate: 10
   loadBalancer:
     enabled: true
-    subnetId: "ocid1.subnet.oc1.iad."
+    subnetId: "ocid1.subnet.oc1.iad.aaaaaaaa3mjqpf4ddhccc4mdgwsj3bgotl5w2l72lc447zo3qzx4smsadexa"
     isPrivate: true
     listenerPort: 80
     backendPort: 80
@@ -64,4 +64,4 @@ spec:
   instances:
     - name: web
       count: 2
-      subnetId: "ocid1.subnet.oc1.iad."
+      subnetId: "ocid1.subnet.oc1.iad.aaaaaaaa3mjqpf4ddhccc4mdgwsj3bgotl5w2l72lc447zo3qzx4smsadexa"

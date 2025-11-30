@@ -260,11 +260,13 @@ func startHTTPServer(f *fleet.Fleet, st *state.Store, cfg *config.FleetConfig, a
 	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
 		// Simple JSON metrics for now
 		localActive, _ := st.CountActive(cfg.Metadata.Name)
+		// use control loop snapshot to avoid concurrent SDK calls (prevents race)
+		cs := ctrlStatus.snapshot()
 		remoteActive := 0
-		if f.Client != nil {
-			if inst, err := f.Client.ListInstancesByFleet(r.Context(), cfg.Spec.CompartmentID, cfg.Metadata.Name); err == nil {
-				remoteActive = len(inst)
-			}
+		if v, ok := cs["actual"].(int); ok {
+			remoteActive = v
+		} else if df, ok := cs["actual"].(float64); ok {
+			remoteActive = int(df)
 		}
 		var lbSnapshot any
 		if lb, ok, _ := st.GetLBInfo(cfg.Metadata.Name); ok {
@@ -307,12 +309,20 @@ func startHTTPServer(f *fleet.Fleet, st *state.Store, cfg *config.FleetConfig, a
 			http.Error(w, "desired must be >= 0", http.StatusBadRequest)
 			return
 		}
-		if err := f.Scale(body.Desired); err != nil {
-			http.Error(w, fmt.Sprintf("scale failed: %v", err), http.StatusInternalServerError)
-			return
+		desired := body.Desired
+		// Enqueue requested desired to show in Scale queue badge immediately.
+		// Do not override current scaling badge; it should reflect the active operation.
+		localActive, _ := st.CountActive(cfg.Metadata.Name)
+		if desired != localActive {
+			metrics.AppendScaleQueue(desired)
 		}
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("scale OK"))
+		go func(d int) {
+			if err := f.Scale(d); err != nil {
+				log.Printf("scale failed (async): %v", err)
+			}
+		}(desired)
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte("scale accepted"))
 	})
 
 	mux.HandleFunc("/rolling-restart", func(w http.ResponseWriter, r *http.Request) {
@@ -383,10 +393,10 @@ func startHTTPServer(f *fleet.Fleet, st *state.Store, cfg *config.FleetConfig, a
 				// compute local/remote
 				localActive, _ := st.CountActive(cfg.Metadata.Name)
 				remoteActive := 0
-				if f.Client != nil {
-					if inst, err := f.Client.ListInstancesByFleet(ctx, cfg.Spec.CompartmentID, cfg.Metadata.Name); err == nil {
-						remoteActive = len(inst)
-					}
+				if v, ok := ctrl["actual"].(int); ok {
+					remoteActive = v
+				} else if df, ok := ctrl["actual"].(float64); ok {
+					remoteActive = int(df)
 				}
 
 				// status HTML (Desired vs Remote vs Local)
@@ -415,6 +425,30 @@ func startHTTPServer(f *fleet.Fleet, st *state.Store, cfg *config.FleetConfig, a
 				act := metrics.Snapshot()
 				actJSON, _ := json.MarshalIndent(act, "", "  ")
 				metricsHTML := "<pre>" + string(actJSON) + "</pre>"
+
+				// Build Scale Queue badge from actions metrics
+				scaleQueue := []int{}
+				if arr, ok := act["scaleQueue"].([]int); ok {
+					scaleQueue = append(scaleQueue, arr...)
+				} else if arrAny, ok := act["scaleQueue"].([]any); ok {
+					for _, it := range arrAny {
+						switch tv := it.(type) {
+						case int:
+							scaleQueue = append(scaleQueue, tv)
+						case float64:
+							scaleQueue = append(scaleQueue, int(tv))
+						}
+					}
+				}
+				vals := []string{}
+				for _, x := range scaleQueue {
+					vals = append(vals, fmt.Sprintf("%d", x))
+				}
+				valStr := "empty"
+				if len(vals) > 0 {
+					valStr = strings.Join(vals, ", ")
+				}
+				scaleQueueBadgeHTML := fmt.Sprintf("<div class='badge scalequeue-badge'>Scale queue: %s</div>", html.EscapeString(valStr))
 
 				// LB badge HTML derived from metrics
 				lbEnabled := false
@@ -541,7 +575,7 @@ func startHTTPServer(f *fleet.Fleet, st *state.Store, cfg *config.FleetConfig, a
 					}
 					fmt.Fprint(w, "\n")
 				}
-				writeEvent("status", fleetNameHTML+lbBadgeHTML+scaleBadgeHTML+rrBadgeHTML+driftBadgeHTML+minimumsHTML+statusHTML)
+				writeEvent("status", fleetNameHTML+lbBadgeHTML+scaleBadgeHTML+rrBadgeHTML+driftBadgeHTML+scaleQueueBadgeHTML+minimumsHTML+statusHTML)
 				writeEvent("metrics", metricsHTML)
 				writeEvent("control", controlHTML)
 				fl.Flush()
@@ -732,7 +766,7 @@ func openAPISpecJSON() string {
           }
         },
         "responses": {
-          "200": { "description": "Scale accepted", "content": { "text/plain": { } } },
+          "202": { "description": "Accepted - scaling in background", "content": { "text/plain": { } } },
           "400": { "description": "Bad request", "content": { "text/plain": { } } },
           "500": { "description": "Error", "content": { "text/plain": { } } }
         }
@@ -814,6 +848,7 @@ pre { background: #f7f7f7; padding: 12px; overflow: auto; border-radius: 6px; }
 .badge.drift.drift-alert { background:#fee2e2; color:#991b1b; border-color:#fecaca; }
 .minimums { margin-top:8px; padding:8px; background: var(--chip); border:1px solid var(--border); border-radius:6px; }
 .minimums .groups { font-size:0.8rem; color: var(--muted); margin-top:4px; }
+.badge.scalequeue-badge { background:#f3f4f6; color:#374151; border-color:#e5e7eb; margin-left:8px; }
 </style>
 </head>
 <body hx-ext="sse" sse-connect="/events">

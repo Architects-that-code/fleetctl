@@ -142,7 +142,7 @@ Note on Rancher Fleet extension warnings:
   - --status           Print tracked fleet state and exit
   - --state string     Path to local state JSON (default ".fleetctl/state.json")
 - Behavior:
-  - Scaling up adds records; scaling down marks records as terminated (LIFO by default).
+  - Scaling up adds records; scaling down marks records as terminated (FIFO — oldest first).
   - Status prints a human-readable summary grouped by instance group.
 - Examples:
   - make run ARGS="--config fleet.yaml --status"
@@ -174,21 +174,69 @@ Endpoints:
 - GET /openapi.json   OpenAPI 3.0 schema for the HTTP API
 
 Badges (UI):
-- Load Balancer badge:
-  - "LB disabled" when spec.loadBalancer.enabled is false
-  - "LB X backends" when enabled and reconciled; X reflects current backend count
 - Scaling badge (always visible):
-  - "Scaling up" when current operation == "scale-up"
-  - "Scaling down" when current operation == "scale-down"
-  - "Scaling idle" otherwise
+  - Source: metrics.operation, metrics.phase, metrics.startTotal, metrics.targetTotal, metrics.launchSucceeded, metrics.terminateSucceeded.
+  - Semantics:
+    - "Scaling up to T (X of N)" when operation == "scale-up"; X = launchSucceeded, N = max(0, targetTotal - startTotal).
+    - "Scaling down to T (X of N)" when operation == "scale-down"; X = terminateSucceeded, N = max(0, startTotal - targetTotal).
+    - "Scaling idle" when operation is empty or phase == "done".
+  - Note: The scaling badge reflects the active operation only. /scale requests are enqueued and do NOT change this badge until the operation actually starts under Fleet.opMu.
+- Rolling Restart badge:
+  - Source: metrics.operation == "rolling-restart", metrics.rollingRestartIndex and metrics.rollingRestartTotal.
+  - Semantics: "Rolling restart i/total" while in progress; hidden when not active.
+- Load Balancer badge:
+  - Source: metrics.lbEnabled and metrics.lbBackends (optimistic updates during backend removals).
+  - Semantics:
+    - "LB disabled" when spec.loadBalancer.enabled is false.
+    - "LB X backends" when enabled; X may optimistically decrement immediately when removals begin; final count is reconciled every loop tick and after scale/rolling-restart completes.
+- Drift badge:
+  - Source: control loop snapshot (ctrlStatus.desired vs ctrlStatus.actual).
+  - Semantics: "No drift" when desired == actual; "Drift detected" otherwise.
+- Scale queue badge:
+  - Source: metrics.scaleQueue (serialized as [] when empty).
+  - Semantics: Shows queued desired totals comma-separated, or "empty" when [].
+  - Ordering and FIFO: New scale events are appended to the END of the queue by /scale; the head is popped only when Fleet.Scale begins (under opMu) and only if the desired matches the head (FIFO).
+- Minimums badge:
+  - Source: sum(spec.instances[].count) and per-group counts from the currently loaded config.
+  - Semantics: Displays the config-file minimums used by the lower-bound scaling policy.
 
-Control loop policy (only scale up automatically):
+Badge ordering in the UI:
+Fleet name, LB, Scaling, Rolling Restart, Drift, Scale queue, Minimums, then the status grid.
+
+Control loop flow and states
+
+Policy (only scale up automatically; lower-bound protection):
 - desiredFromConfig = sum(spec.instances[].count)
 - localBaseline = active count from the local state store
 - target = max(desiredFromConfig, localBaseline)
 - If actual < target: scale up to target
 - If actual >= target: no automatic downscale
 - Load balancer backends are reconciled every control loop tick
+
+Flow per tick:
+1) Reload configuration if the file changed and update ctrlStatus.lastConfigReload.
+2) Compute desiredFromConfig and apply lower-bound (local baseline) to produce target; set ctrlStatus.desired.
+3) Query OCI for actual instances; set ctrlStatus.actual and lastError.
+4) If actual < target, invoke Fleet.Scale(target). Operations are serialized by Fleet.opMu. The scaling badge is driven solely by metrics set inside Scale().
+5) Reconcile the load balancer to match the set of active instances.
+6) Emit updated snapshots for /metrics, /control, and SSE UI.
+
+Operation phases (metrics.phase):
+- planning: metrics.Reset() was called for a new operation.
+- launch: creating instances (scale-up) or after each terminate during rolling restart.
+- terminate: deleting instances (scale-down) or per-step during rolling restart.
+- verify: waiting until remote actual equals desired target.
+- done: operation completed; metrics.operation cleared so the scaling badge returns to "Scaling idle".
+
+Scale queue semantics:
+- /scale enqueues the requested desired to metrics.scaleQueue and returns 202 immediately (fast path).
+- The queue is FIFO: new events are added to the END; the head is popped only when Fleet.Scale begins (under opMu) and matches the head (metrics.PopScaleQueueIfHead).
+- The scaling badge reflects only the active operation; queued values appear exclusively in the "Scale queue" badge.
+
+Concurrency and safety:
+- All mutating fleet operations (scale, rolling restart, LB changes) are serialized by Fleet.opMu.
+- HTTP handlers avoid direct OCI list calls for counts; they consume control loop snapshots to prevent SDK retry races.
+- LB metrics use optimistic decrement when removals begin and a post-operation reconcile to restore authoritative counts.
 
 Notes:
 - You can still downscale explicitly with POST /scale and a lower desired; this performs LB deregistration before terminating instances. The control loop itself will not automatically downscale below the local baseline.

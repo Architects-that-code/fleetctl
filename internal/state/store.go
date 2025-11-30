@@ -306,6 +306,37 @@ func (s *Store) ActiveRecordsLIFO(fleetName string, n int) ([]InstanceRecord, er
 	return out, nil
 }
 
+// ActiveRecordsFIFO returns up to n active records in FIFO order without mutating state.
+func (s *Store) ActiveRecordsFIFO(fleetName string, n int) ([]InstanceRecord, error) {
+	if n <= 0 {
+		return nil, nil
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	r, err := s.load()
+	if err != nil {
+		return nil, err
+	}
+	fs := r.Fleets[fleetName]
+
+	activeIdx := make([]int, 0, len(fs.Instances))
+	for idx, inst := range fs.Instances {
+		if inst.Status == StatusActive {
+			activeIdx = append(activeIdx, idx)
+		}
+	}
+	sort.Ints(activeIdx)
+
+	out := make([]InstanceRecord, 0, n)
+	for i := 0; i < len(activeIdx) && len(out) < n; i++ {
+		idx := activeIdx[i]
+		out = append(out, fs.Instances[idx])
+	}
+	return out, nil
+}
+
 // MarkTerminatedByIDs marks any instances with matching IDs as terminated.
 func (s *Store) MarkTerminatedByIDs(fleetName string, ids []string) error {
 	if len(ids) == 0 {
