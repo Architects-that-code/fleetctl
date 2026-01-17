@@ -17,7 +17,6 @@ import (
 
 	"fleetctl/internal/client"
 	"fleetctl/internal/config"
-	"fleetctl/internal/diagram"
 	"fleetctl/internal/fleet"
 	"fleetctl/internal/metrics"
 	"fleetctl/internal/state"
@@ -36,7 +35,6 @@ var (
 	flagSyncState      bool
 	flagHTTP           string
 	flagReconcileEvery time.Duration
-	flagDiagram        string
 )
 
 // controlStatus tracks the background control loop state for diagnostics.
@@ -92,11 +90,10 @@ func init() {
 	flag.BoolVar(&flagSyncState, "sync-state", false, "Rebuild local state by querying OCI for instances tagged to this fleet")
 	flag.StringVar(&flagHTTP, "http", "", "Listen address for HTTP API (e.g., :8080). Serves /healthz, /status, /metrics and command endpoints.")
 	flag.DurationVar(&flagReconcileEvery, "reconcile-every", 30*time.Second, "Background reconcile interval for --http mode (e.g., 30s, 1m)")
-	flag.StringVar(&flagDiagram, "diagram", "", "Generate Mermaid diagram (packages, architecture)")
 
 	// Custom usage printer
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "fleetctl %s\n\nUsage:\n  %s [flags]\n\nRequires: --config plus at least one additional flag, or --diagram, or --version\n\nFlags:\n", version, os.Args[0])
+		fmt.Fprintf(os.Stderr, "fleetctl %s\n\nUsage:\n  %s [flags]\n\nRequires: --config plus at least one additional flag or --version\n\nFlags:\n", version, os.Args[0])
 		flag.PrintDefaults()
 	}
 }
@@ -106,39 +103,6 @@ func main() {
 
 	if flagVersion {
 		fmt.Println(version)
-		return
-	}
-
-	// Handle --diagram flag (standalone, doesn't require --config)
-	if flagDiagram != "" {
-		// Determine project root (directory containing go.mod)
-		rootDir, err := findProjectRoot()
-		if err != nil {
-			log.Fatalf("find project root: %v", err)
-		}
-
-		gen, err := diagram.NewGenerator(rootDir)
-		if err != nil {
-			log.Fatalf("init diagram generator: %v", err)
-		}
-
-		var diagType diagram.DiagramType
-		switch strings.ToLower(flagDiagram) {
-		case "packages", "package", "pkg", "deps":
-			diagType = diagram.PackageDeps
-		case "architecture", "arch", "overview":
-			diagType = diagram.Architecture
-		default:
-			fmt.Fprintf(os.Stderr, "Unknown diagram type: %s\n", flagDiagram)
-			fmt.Fprintf(os.Stderr, "Available types: packages, architecture\n")
-			os.Exit(1)
-		}
-
-		output, err := gen.Generate(diagType)
-		if err != nil {
-			log.Fatalf("generate diagram: %v", err)
-		}
-		fmt.Print(output)
 		return
 	}
 
@@ -690,6 +654,21 @@ func startControlLoop(f *fleet.Fleet, cfgPath string, every time.Duration) {
 			}
 			ctrlStatus.set(func(c *controlStatus) { c.Desired = target })
 
+			// Yield to any in-progress manual operation (e.g., /scale) so control loop doesn't interfere
+			// We use metrics.Operation as the indicator; metrics.Done() clears it when finished.
+			if act := metrics.Snapshot(); act != nil {
+				if op, ok := act["operation"].(string); ok && strings.TrimSpace(op) != "" {
+					phase := ""
+					if pv, ok := act["phase"].(string); ok {
+						phase = pv
+					}
+					if strings.ToLower(phase) != "done" {
+						ctrlStatus.set(func(c *controlStatus) { c.LastAction = "yield to " + op })
+						continue
+					}
+				}
+			}
+
 			// 3) Compare actual vs desired and reconcile if needed
 			if f.Client != nil {
 				inst, err := f.Client.ListInstancesByFleet(context.Background(), f.Config.Spec.CompartmentID, f.Config.Metadata.Name)
@@ -717,6 +696,20 @@ func startControlLoop(f *fleet.Fleet, cfgPath string, every time.Duration) {
 			}
 
 			// 4) Load balancer reconcile every tick
+			// Yield LB reconcile as well if a manual operation is in progress to avoid interleaving
+			if act := metrics.Snapshot(); act != nil {
+				if op, ok := act["operation"].(string); ok && strings.TrimSpace(op) != "" {
+					phase := ""
+					if pv, ok := act["phase"].(string); ok {
+						phase = pv
+					}
+					if strings.ToLower(phase) != "done" {
+						ctrlStatus.set(func(c *controlStatus) { c.LastAction = "yield lb-reconcile to " + op })
+						<-ticker.C
+						continue
+					}
+				}
+			}
 			if f.Client != nil {
 				ctrlStatus.set(func(c *controlStatus) { c.LastAction = "lb-reconcile" })
 				if err := f.ReconcileLoadBalancer(context.Background()); err != nil {
